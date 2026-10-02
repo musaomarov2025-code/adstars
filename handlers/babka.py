@@ -30,7 +30,7 @@ def detect_gender(name: str) -> str:
     return "m"
 
 
-# ==== /start в личке ====
+# ==== /start ====
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -55,7 +55,7 @@ async def cmd_start(message: Message):
     )
 
 
-# ==== Приветствие при добавлении в группу ====
+# ==== Приветствие ====
 @router.message(F.new_chat_members)
 async def on_add_to_group(message: Message):
     me = await message.bot.get_me()
@@ -90,7 +90,7 @@ async def handle_text(message: Message):
         except Exception as e:
             print(f"[track error] {e}")
 
-    # ==== ТРИГГЕР 1: «бабка» / «бабуль» / «бабуля» ====
+    # ==== ТРИГГЕР 1: «бабка»/«бабуль» ====
     triggers = ["бабка", "бабуль", "бабуля", "бабушка", "бабке", "бабку", "бабки"]
     if any(w in text_lower for w in triggers):
         try:
@@ -103,7 +103,7 @@ async def handle_text(message: Message):
             print(f"[trigger1 error] {e}")
         return
 
-    # ==== ТРИГГЕР 2: Reply на её сообщение ====
+    # ==== ТРИГГЕР 2: Reply ====
     if message.reply_to_message and message.reply_to_message.from_user:
         if message.reply_to_message.from_user.is_bot:
             try:
