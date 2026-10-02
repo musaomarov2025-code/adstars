@@ -3,10 +3,8 @@ import os
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_ЛОКАЛЬНО")
 ADMIN_ID = 8742164697
 
-# БД в папке проекта
 DB_PATH = "bot.db"
-
-CHIME_EVERY = 3
+CHIME_EVERY = 5
 
 FEMALE_NAMES = {
     "аня", "анна", "маша", "мария", "катя", "екатерина", "лена", "елена",
