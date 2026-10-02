@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN
 from database import init_db
-from handlers import babka
+from handlers import babka, admin
 
 logging.basicConfig(level=logging.INFO)
 
@@ -17,6 +17,8 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# Порядок важен: админ — первым (чтобы /admin не перехватывался бабкой)
+dp.include_router(admin.router)
 dp.include_router(babka.router)
 
 
