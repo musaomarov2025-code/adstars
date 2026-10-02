@@ -33,13 +33,7 @@ def detect_gender(name: str) -> str:
     return "m"
 
 
-# ==== Отслеживание добавления в группы ====
-@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def track_group(message: Message):
-    await add_chat(message.chat.id, message.chat.title or "Без названия")
-
-
-# ==== Реакция на «бабка» / «бабуль» ====
+# ==== Главный хендлер на все текстовые сообщения ====
 @router.message(F.text)
 async def handle_text(message: Message):
     if not message.text:
@@ -47,9 +41,14 @@ async def handle_text(message: Message):
 
     text_lower = message.text.lower()
     user = message.from_user
-
-    # Считаем сообщения только в группах
     is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+
+    # Сохраняем чат в БД (если группа)
+    if is_group:
+        try:
+            await add_chat(message.chat.id, message.chat.title or "Без названия")
+        except Exception as e:
+            print(f"[track_group error] {e}")
 
     # ==== ТРИГГЕР 1: «бабка» / «бабуль» ====
     if "бабка" in text_lower or "бабуль" in text_lower or "бабушка" in text_lower:
@@ -76,6 +75,9 @@ async def handle_text(message: Message):
         message_counters[message.chat.id] = counter
 
         if counter % CHIME_EVERY == 0:
-            mat_on = await is_mat_enabled(message.chat.id)
+            try:
+                mat_on = await is_mat_enabled(message.chat.id)
+            except Exception:
+                mat_on = True
             pool = CHIME_PHRASES + (CHIME_PHRASES_MAT if mat_on else [])
             await message.reply(random.choice(pool))
