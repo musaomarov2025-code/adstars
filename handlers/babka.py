@@ -1,0 +1,81 @@
+import random
+from aiogram import Router, F
+from aiogram.types import Message
+from aiogram.enums import ChatType
+
+from config import CHIME_EVERY, FEMALE_NAMES, MALE_EXCEPTIONS
+from phrases import (
+    reaction_to_name,
+    reply_to_babka,
+    CHIME_PHRASES,
+    CHIME_PHRASES_MAT,
+)
+from database import save_user, get_user_gender, is_mat_enabled, add_chat
+
+router = Router()
+
+# Счётчик сообщений в каждом чате (в памяти)
+message_counters: dict[int, int] = {}
+
+
+def detect_gender(name: str) -> str:
+    """Определяем пол по имени."""
+    first_name = name.split()[0].lower()
+
+    if first_name in FEMALE_NAMES:
+        return "f"
+    if first_name in MALE_EXCEPTIONS:
+        return "m"
+
+    # Fallback по окончанию
+    if first_name.endswith(("а", "я", "ия")):
+        return "f"
+    return "m"
+
+
+# ==== Отслеживание добавления в группы ====
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def track_group(message: Message):
+    await add_chat(message.chat.id, message.chat.title or "Без названия")
+
+
+# ==== Реакция на «бабка» / «бабуль» ====
+@router.message(F.text)
+async def handle_text(message: Message):
+    if not message.text:
+        return
+
+    text_lower = message.text.lower()
+    user = message.from_user
+
+    # Считаем сообщения только в группах
+    is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+
+    # ==== ТРИГГЕР 1: «бабка» / «бабуль» ====
+    if "бабка" in text_lower or "бабуль" in text_lower or "бабушка" in text_lower:
+        gender = await get_user_gender(user.id)
+        if not gender:
+            gender = detect_gender(user.full_name)
+            await save_user(user.id, user.full_name, gender)
+        await message.reply(reaction_to_name(gender))
+        return
+
+    # ==== ТРИГГЕР 2: Reply на её сообщение ====
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.is_bot:
+            gender = await get_user_gender(user.id)
+            if not gender:
+                gender = detect_gender(user.full_name)
+                await save_user(user.id, user.full_name, gender)
+            await message.reply(reply_to_babka(gender))
+            return
+
+    # ==== ТРИГГЕР 3: Влезает сама ====
+    if is_group:
+        counter = message_counters.get(message.chat.id, 0) + 1
+        message_counters[message.chat.id] = counter
+
+        if counter % CHIME_EVERY == 0:
+            mat_on = await is_mat_enabled(message.chat.id)
+            pool = CHIME_PHRASES + (CHIME_PHRASES_MAT if mat_on else [])
+            await message.reply(random.choice(pool))
