@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
@@ -152,7 +152,87 @@ async def ap_toggle(call: CallbackQuery):
         f"🛠 <b>АДМИН-ПАНЕЛЬ</b>\n\n{ap_menu_text()}",
         reply_markup=ap_menu_kb(not current),
         parse_mode="HTML")
-  # ================== ТЕКСТЫ ==================
+
+
+# ================== АВТО-ДОБАВЛЕНИЕ В ЧАТ ==================
+@dp.my_chat_member()
+async def on_chat_member_update(update: ChatMemberUpdated):
+    """Срабатывает, когда бота добавляют/удаляют из чата."""
+    chat = update.chat
+    new_status = update.new_chat_member.status
+    old_status = update.old_chat_member.status
+
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    chat_id = str(chat.id)
+    chat_title = chat.title or "без названия"
+
+    # === БОТА ДОБАВИЛИ ===
+    if new_status in ("member", "administrator") and old_status in ("left", "kicked"):
+        chats = _load_json("autopost_chats")
+
+        if chat_id in chats:
+            return
+
+        if len(chats) >= 50:
+            try:
+                await bot.send_message(
+                    OWNER_ID,
+                    f"⚠️ <b>Лимит 50 чатов достигнут</b>\n"
+                    f"Не могу добавить: <b>{chat_title}</b>\n"
+                    f"<code>{chat_id}</code>",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+            return
+
+        chats.append(chat_id)
+        _save_json("autopost_chats", chats)
+
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"✅ <b>Бот добавлен в чат</b>\n\n"
+                f"📌 <b>{chat_title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                f"📊 Всего чатов: <b>{len(chats)}</b>\n\n"
+                f"<i>Если не хочешь постить здесь — удали через /admin → 🆔 Чаты.</i>",
+                parse_mode="HTML")
+        except Exception:
+            pass
+
+        try:
+            await bot.send_message(
+                chat_id,
+                f"👋 Привет! Я добавлен для автопостов.\n\n"
+                f"Писать буду редко и по делу. "
+                f"Если что-то не понравится — просто удалите меня из группы.")
+        except Exception:
+            pass
+
+        print(f"[adbot] + добавлен в {chat_id} ({chat_title})")
+
+    # === БОТА УДАЛИЛИ / КИКНУЛИ ===
+    elif new_status in ("left", "kicked") and old_status in ("member", "administrator"):
+        chats = _load_json("autopost_chats")
+        if chat_id in chats:
+            chats.remove(chat_id)
+            _save_json("autopost_chats", chats)
+
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"🗑 <b>Бот удалён из чата</b>\n\n"
+                f"📌 <b>{chat_title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                f"📊 Осталось чатов: <b>{len(chats)}</b>",
+                parse_mode="HTML")
+        except Exception:
+            pass
+
+        print(f"[adbot] - удалён из {chat_id} ({chat_title})")
+        # ================== ТЕКСТЫ ==================
 @dp.callback_query(F.data == "ap_texts")
 async def ap_texts_cb(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != OWNER_ID:
@@ -183,7 +263,6 @@ async def ap_text_save(message: Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
         return
     texts = _load_json("autopost_texts")
-    # сохраняем html_text (сохраняет форматирование)
     text = message.html_text or message.text or ""
     texts.append(text)
     _save_json("autopost_texts", texts)
@@ -251,7 +330,9 @@ async def ap_chats_cb(call: CallbackQuery, state: FSMContext):
     chats = _load_json("autopost_chats")
     try:
         await call.message.edit_text(
-            f"🆔 <b>Чаты</b>\n\nСохранено: <b>{len(chats)}</b>",
+            f"🆔 <b>Чаты</b>\n\nСохранено: <b>{len(chats)}</b>\n\n"
+            f"Бот добавляет чаты <b>автоматически</b>, когда его туда добавляют.\n"
+            f"Можно добавить вручную по ID.",
             reply_markup=chats_kb(), parse_mode="HTML")
     except Exception:
         await call.message.answer(
@@ -265,7 +346,7 @@ async def ap_chat_add(call: CallbackQuery, state: FSMContext):
         return
     await call.message.answer(
         "🆔 Пришли ID чата (например <code>-1001234567890</code>)\n\n"
-        "Или добавь бота в чат и напиши там /addchat.",
+        "Или добавь бота в чат — он сохранится автоматически.",
         parse_mode="HTML")
     await state.set_state(AddChat.waiting)
 
@@ -281,6 +362,9 @@ async def ap_chat_save(message: Message, state: FSMContext):
     chats = _load_json("autopost_chats")
     if value in chats:
         await message.answer("⚠️ Уже есть.")
+        return
+    if len(chats) >= 50:
+        await message.answer("⚠️ Лимит 50 чатов.")
         return
     chats.append(value)
     _save_json("autopost_chats", chats)
@@ -300,6 +384,8 @@ async def ap_chat_show(call: CallbackQuery):
     text = "🆔 <b>Чаты:</b>\n\n"
     for i, c in enumerate(chats, 1):
         text += f"<b>{i}.</b> <code>{c}</code>\n"
+    if len(text) > 4000:
+        text = text[:4000] + "\n...обрезано"
     await call.message.answer(text, parse_mode="HTML")
 
 
@@ -335,10 +421,13 @@ async def ap_chat_del(message: Message, state: FSMContext):
                          reply_markup=back_admin_kb(), parse_mode="HTML")
 
 
-# ================== /addchat в чате ==================
+# ================== /addchat (запасной способ) ==================
 @dp.message(Command("addchat"))
 async def addchat_cmd(message: Message):
     if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type not in ("group", "supergroup"):
+        await message.answer("⚠️ Команда работает только в группе.")
         return
     chat_id = str(message.chat.id)
     chats = _load_json("autopost_chats")
@@ -346,7 +435,7 @@ async def addchat_cmd(message: Message):
         await message.answer("⚠️ Этот чат уже в списке.")
         return
     if len(chats) >= 50:
-        await message.answer("⚠️ Достигнут лимит 50 чатов.")
+        await message.answer("⚠️ Лимит 50 чатов.")
         return
     chats.append(chat_id)
     _save_json("autopost_chats", chats)
@@ -391,7 +480,7 @@ async def ap_media_add(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != OWNER_ID:
         return
     await call.message.answer(
-        "📎 Пришли фото / видео / GIF / стикер — бот сохранит его как медиа для постов.")
+        "📎 Пришли фото / видео / GIF / стикер — бот сохранит как медиа.")
     await state.set_state(SetMedia.waiting)
 
 
@@ -511,11 +600,13 @@ async def ap_interval_save(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Интервал: <b>{val}</b> сек",
                          reply_markup=back_admin_kb(), parse_mode="HTML")
-  # ================== ОТЧЁТ ==================
+
+
+# ================== ОТЧЁТ ==================
 REPORT_STATS = {
     "sent": 0,
     "errors": 0,
-    "kicked": [],  # список кортежей (chat_id, когда)
+    "kicked": [],
 }
 
 
@@ -570,12 +661,10 @@ async def autopost_worker():
             media_id = get_setting("autopost_media_id")
             kb = _build_buttons()
 
-            # проходим по всем чатам по кругу
             for chat_raw in list(chats):
                 if get_setting("autopost_enabled") != "1":
                     break
 
-                # берём следующий текст по кругу
                 text = texts[idx_text % len(texts)]
                 idx_text += 1
 
@@ -602,7 +691,6 @@ async def autopost_worker():
                                 caption=text or None, reply_markup=kb,
                                 parse_mode="HTML" if text else None)
                         elif media_type == "sticker" and media_id:
-                            # стикер без текста
                             await bot.send_sticker(chat_id=cid, sticker=media_id)
                             if text:
                                 await bot.send_message(
@@ -616,7 +704,6 @@ async def autopost_worker():
                         print(f"[adbot] отправлено в {cid}")
                     except Exception as e_inner:
                         es = str(e_inner).lower()
-                        # если HTML не спарсился — повтор без parse_mode
                         if "parse entities" in es or "unclosed" in es or "can't parse" in es:
                             try:
                                 if media_type == "photo" and media_id:
@@ -634,13 +721,11 @@ async def autopost_worker():
                                 continue
                             except Exception:
                                 pass
-                        # проверка на изгнание
                         if ("kicked" in es or "bot was blocked" in es
                                 or "not enough rights" in es
                                 or "chat not found" in es
                                 or "bot is not a member" in es
                                 or "have no rights" in es):
-                            # удаляем чат из списка
                             if chat_raw in chats:
                                 chats.remove(chat_raw)
                                 _save_json("autopost_chats", chats)
@@ -663,7 +748,6 @@ async def autopost_worker():
                     REPORT_STATS["errors"] += 1
                     print(f"[adbot] крит. ошибка {chat_raw}: {e}")
 
-                # пауза между чатами
                 await asyncio.sleep(interval)
 
         except Exception as e:
@@ -671,7 +755,7 @@ async def autopost_worker():
             await asyncio.sleep(30)
 
 
-# ================== ФОН: ДНЕВНОЙ ОТЧЁТ ==================
+# ================== ДНЕВНОЙ ОТЧЁТ ==================
 async def daily_report():
     while True:
         try:
@@ -686,7 +770,6 @@ async def daily_report():
                 await bot.send_message(OWNER_ID, report_text(), parse_mode="HTML")
             except Exception as e:
                 print("daily_report send error:", e)
-            # сбрасываем счётчики
             REPORT_STATS["sent"] = 0
             REPORT_STATS["errors"] = 0
             REPORT_STATS["kicked"] = []
