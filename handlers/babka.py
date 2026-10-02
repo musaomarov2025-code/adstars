@@ -7,16 +7,27 @@ from aiogram.filters import CommandStart
 from config import CHIME_EVERY, FEMALE_NAMES, MALE_EXCEPTIONS
 from phrases import (
     reaction_to_name,
-    reply_to_babka,
     CHIME_PHRASES,
     CHIME_PHRASES_MAT,
     WELCOME_TO_GROUP,
+    KEYWORD_REPLIES,
+    MAT_REPLIES,
 )
-from database import save_user, get_user_gender, is_mat_enabled, add_chat
+from database import (
+    save_user, get_user_gender, is_mat_enabled, add_chat, set_chat_link
+)
 
 router = Router()
 
 message_counters: dict[int, int] = {}
+
+# Скучные сообщения, на которые НЕ отвечаем
+BORING = {"ок", "окей", "ага", "угу", "да", "нет", "хз", "ясно", "понятно",
+          "+", "++", "+++", "лол", "кек", "ммм", "мм", "эм", "ну", "оу", "ой"}
+
+# Матные корни для проверки
+MAT_ROOTS = ["хуй", "пизд", "ебал", "ебан", "ебат", "бляд", "сука", "нахуй",
+             "ебать", "ёб", "долбоёб", "пидор", "хуесос", "мудак", "мразь"]
 
 
 def detect_gender(name: str) -> str:
@@ -28,6 +39,20 @@ def detect_gender(name: str) -> str:
     if first_name.endswith(("а", "я", "ия")):
         return "f"
     return "m"
+
+
+def find_keyword_reply(text_lower: str):
+    """Ищет ключевое слово и возвращает ответ в тему."""
+    for keywords, replies in KEYWORD_REPLIES.items():
+        for kw in keywords:
+            if kw in text_lower:
+                return random.choice(replies)
+    return None
+
+
+def has_mat(text_lower: str) -> bool:
+    """Проверяет, есть ли мат в сообщении."""
+    return any(root in text_lower for root in MAT_ROOTS)
 
 
 # ==== /start ====
@@ -55,7 +80,7 @@ async def cmd_start(message: Message):
     )
 
 
-# ==== Приветствие ====
+# ==== Приветствие + сохранение ссылки ====
 @router.message(F.new_chat_members)
 async def on_add_to_group(message: Message):
     me = await message.bot.get_me()
@@ -65,10 +90,28 @@ async def on_add_to_group(message: Message):
                 await message.answer(random.choice(WELCOME_TO_GROUP))
             except Exception as e:
                 print(f"[welcome error] {e}")
+
             try:
                 await add_chat(message.chat.id, message.chat.title or "Без названия")
             except Exception as e:
                 print(f"[add_chat error] {e}")
+
+            link = None
+            if message.chat.username:
+                link = f"https://t.me/{message.chat.username}"
+            if not link:
+                try:
+                    invite = await message.bot.create_chat_invite_link(message.chat.id)
+                    link = invite.invite_link
+                except Exception as e:
+                    print(f"[invite error] {e}")
+
+            if link:
+                try:
+                    await set_chat_link(message.chat.id, link)
+                except Exception as e:
+                    print(f"[set_link error] {e}")
+
             return
 
 
@@ -80,7 +123,7 @@ async def handle_text(message: Message):
     if message.text.startswith("/"):
         return
 
-    text_lower = message.text.lower()
+    text_lower = message.text.lower().strip()
     user = message.from_user
     is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
@@ -103,20 +146,48 @@ async def handle_text(message: Message):
             print(f"[trigger1 error] {e}")
         return
 
-    # ==== ТРИГГЕР 2: Reply ====
+    # ==== Пропускаем скучные сообщения ====
+    if text_lower in BORING or len(text_lower) < 2:
+        return
+
+    # ==== ТРИГГЕР 2: Reply на её сообщение ====
     if message.reply_to_message and message.reply_to_message.from_user:
         if message.reply_to_message.from_user.is_bot:
             try:
-                gender = await get_user_gender(user.id)
-                if not gender:
-                    gender = detect_gender(user.full_name)
-                    await save_user(user.id, user.full_name, gender)
-                await message.reply(reply_to_babka(gender))
+                # Сначала пробуем найти ключевое слово
+                reply = find_keyword_reply(text_lower)
+                if not reply:
+                    # Если мат — отвечаем матом
+                    if has_mat(text_lower):
+                        reply = random.choice(MAT_REPLIES)
+                    else:
+                        # Иначе — общий ответ
+                        reply = reaction_to_name("m")
+                await message.reply(reply)
             except Exception as e:
                 print(f"[trigger2 error] {e}")
             return
 
-    # ==== ТРИГГЕР 3: Влезает сама ====
+    # ==== ТРИГГЕР 3: Ключевые слова (отвечает в тему) ====
+    # Срабатывает с шансом 60% — чтобы не спамить
+    if is_group and random.random() < 0.6:
+        keyword_reply = find_keyword_reply(text_lower)
+        if keyword_reply:
+            try:
+                await message.reply(keyword_reply)
+            except Exception as e:
+                print(f"[keyword error] {e}")
+            return
+
+    # ==== ТРИГГЕР 4: Мат в сообщении (шанс 40%) ====
+    if is_group and random.random() < 0.4 and has_mat(text_lower):
+        try:
+            await message.reply(random.choice(MAT_REPLIES))
+        except Exception as e:
+            print(f"[mat error] {e}")
+        return
+
+    # ==== ТРИГГЕР 5: Влезает сама (раз в N сообщений) ====
     if is_group:
         counter = message_counters.get(message.chat.id, 0) + 1
         message_counters[message.chat.id] = counter
