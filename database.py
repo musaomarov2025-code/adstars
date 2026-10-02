@@ -1,19 +1,19 @@
 import aiosqlite
 from config import DB_PATH
 
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # Чаты
         await db.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 id INTEGER PRIMARY KEY,
                 title TEXT,
                 ad_enabled INTEGER DEFAULT 1,
                 mat_enabled INTEGER DEFAULT 1,
+                link TEXT,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Пользователи
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
@@ -21,7 +21,6 @@ async def init_db():
                 gender TEXT
             )
         """)
-        # Реклама
         await db.execute("""
             CREATE TABLE IF NOT EXISTS ads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +30,6 @@ async def init_db():
                 order_num INTEGER DEFAULT 0
             )
         """)
-        # Лог отправок
         await db.execute("""
             CREATE TABLE IF NOT EXISTS ad_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,13 +39,19 @@ async def init_db():
                 status TEXT
             )
         """)
-        # Настройки
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
+
+        # Миграция: добавить колонку link, если её нет (для старых БД)
+        try:
+            await db.execute("ALTER TABLE chats ADD COLUMN link TEXT")
+        except Exception:
+            pass  # уже есть
+
         await db.commit()
 
 
@@ -63,7 +67,9 @@ async def add_chat(chat_id: int, title: str):
 
 async def get_all_chats():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, title, ad_enabled, mat_enabled FROM chats") as cur:
+        async with db.execute(
+            "SELECT id, title, ad_enabled, mat_enabled FROM chats"
+        ) as cur:
             return await cur.fetchall()
 
 
@@ -94,6 +100,25 @@ async def is_mat_enabled(chat_id: int) -> bool:
             return bool(row[0]) if row else True
 
 
+# ==== ССЫЛКИ НА ЧАТЫ ====
+async def set_chat_link(chat_id: int, link: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE chats SET link = ? WHERE id = ?",
+            (link, chat_id)
+        )
+        await db.commit()
+
+
+async def get_chat_link(chat_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT link FROM chats WHERE id = ?", (chat_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row and row[0] else None
+
+
 # ==== ЮЗЕРЫ ====
 async def save_user(user_id: int, name: str, gender: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -104,7 +129,7 @@ async def save_user(user_id: int, name: str, gender: str):
         await db.commit()
 
 
-async def get_user_gender(user_id: int) -> str | None:
+async def get_user_gender(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT gender FROM users WHERE id = ?", (user_id,)
@@ -141,7 +166,6 @@ async def delete_ad(ad_id: int):
 
 
 async def get_next_ad():
-    """Возвращает следующую рекламу по кругу (чередование)."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM ads") as cur:
             count = (await cur.fetchone())[0]
@@ -188,6 +212,8 @@ async def get_stats():
             users = (await cur.fetchone())[0]
         async with db.execute("SELECT COUNT(*) FROM ads") as cur:
             ads = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM ad_log WHERE status = 'ok'") as cur:
+        async with db.execute(
+            "SELECT COUNT(*) FROM ad_log WHERE status = 'ok'"
+        ) as cur:
             sent = (await cur.fetchone())[0]
         return {"chats": chats, "users": users, "ads": ads, "sent": sent}
