@@ -22,7 +22,7 @@ dp.include_router(babka.router)
 
 async def main():
     await init_db()
-    print("Бабка запущена! 👵")
+    print("Пошлая бабка запущена! 👵")
     await dp.start_polling(bot)
 
 
