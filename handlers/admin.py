@@ -12,7 +12,8 @@ from aiogram.fsm.state import State, StatesGroup
 from config import ADMIN_ID, DB_PATH
 from database import (
     get_all_chats, get_all_ads, add_ad, delete_ad,
-    get_next_ad, log_ad, get_stats, toggle_chat_ad
+    get_next_ad, log_ad, get_stats, toggle_chat_ad,
+    get_chat_link
 )
 
 router = Router()
@@ -84,7 +85,6 @@ async def db_menu_handler(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=db_menu())
 
 
-# ==== Скачать БД ====
 @router.callback_query(F.data == "db_download")
 async def db_download(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -102,7 +102,6 @@ async def db_download(call: CallbackQuery):
         await call.answer(f"Ошибка: {e}", show_alert=True)
 
 
-# ==== Загрузить БД ====
 @router.callback_query(F.data == "db_upload")
 async def db_upload(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
@@ -127,7 +126,6 @@ async def db_receive(message: Message, state: FSMContext):
         await message.answer("❌ Нужен файл с расширением <code>.db</code>")
         return
 
-    # Делаем бэкап старой БД
     backup = DB_PATH + ".backup"
     try:
         if os.path.exists(DB_PATH):
@@ -135,7 +133,6 @@ async def db_receive(message: Message, state: FSMContext):
     except Exception as e:
         print(f"[backup error] {e}")
 
-    # Сохраняем новую БД
     try:
         file = await message.bot.get_file(doc.file_id)
         await message.bot.download_file(file.file_path, DB_PATH)
@@ -151,7 +148,7 @@ async def db_receive(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ==== Меню рекламы ====
+# ==== РЕКЛАМА ====
 @router.callback_query(F.data == "ad_menu")
 async def ad_menu(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -168,7 +165,7 @@ async def ad_menu(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить рекламу", callback_data="ad_add")],
         [InlineKeyboardButton(text="🗑 Удалить последнюю", callback_data="ad_del")],
-        [InlineKeyboardButton(text="▶️ Отправить сейчас (чередование)", callback_data="ad_send")],
+        [InlineKeyboardButton(text="▶️ Отправить сейчас", callback_data="ad_send")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
     ])
     await call.message.edit_text(text, reply_markup=kb)
@@ -248,11 +245,12 @@ async def ad_send(call: CallbackQuery):
     )
 
 
-# ==== Меню групп ====
+# ==== ГРУППЫ ====
 @router.callback_query(F.data == "chats_menu")
 async def chats_menu(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
+
     chats = await get_all_chats()
 
     if not chats:
@@ -266,11 +264,32 @@ async def chats_menu(call: CallbackQuery):
         for chat in chats:
             chat_id, title, ad_enabled, mat_enabled = chat
             mark = "✅" if ad_enabled else "⏸"
-            text += f"{mark} {title} (<code>{chat_id}</code>)\n"
-            buttons.append([InlineKeyboardButton(
-                text=f"{mark} {title[:20]}",
-                callback_data=f"toggle_{chat_id}"
-            )])
+
+            link = await get_chat_link(chat_id)
+
+            if link:
+                text += f"{mark} {title}\n   🔗 {link}\n"
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=f"{mark} {title[:15]} — реклама",
+                        callback_data=f"toggle_{chat_id}"
+                    )
+                ])
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=f"🔗 {title[:20]}",
+                        url=link
+                    )
+                ])
+            else:
+                text += f"{mark} {title} (<code>{chat_id}</code>)\n"
+                buttons.append([
+                    InlineKeyboardButton(
+                        text=f"{mark} {title[:20]}",
+                        callback_data=f"toggle_{chat_id}"
+                    )
+                ])
+
         buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -286,7 +305,7 @@ async def toggle_chat(call: CallbackQuery):
     await chats_menu(call)
 
 
-# ==== Статистика ====
+# ==== СТАТИСТИКА ====
 @router.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
     if not is_admin(call.from_user.id):
