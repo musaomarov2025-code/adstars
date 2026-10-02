@@ -1,10 +1,15 @@
+import os
+import shutil
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    FSInputFile
+)
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from config import ADMIN_ID
+from config import ADMIN_ID, DB_PATH
 from database import (
     get_all_chats, get_all_ads, add_ad, delete_ad,
     get_next_ad, log_ad, get_stats, toggle_chat_ad
@@ -17,6 +22,10 @@ class AdStates(StatesGroup):
     waiting_text = State()
 
 
+class DBStates(StatesGroup):
+    waiting_file = State()
+
+
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
@@ -26,6 +35,15 @@ def admin_menu():
         [InlineKeyboardButton(text="📢 Реклама", callback_data="ad_menu")],
         [InlineKeyboardButton(text="💬 Группы", callback_data="chats_menu")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="🗄 База данных", callback_data="db_menu")],
+    ])
+
+
+def db_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Скачать БД", callback_data="db_download")],
+        [InlineKeyboardButton(text="📤 Загрузить БД", callback_data="db_upload")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
     ])
 
 
@@ -37,12 +55,100 @@ async def cmd_admin(message: Message):
     await message.answer("🔧 <b>АДМИН-ПАНЕЛЬ</b>", reply_markup=admin_menu())
 
 
-# ==== Назад в меню ====
 @router.callback_query(F.data == "main_menu")
-async def back_to_main(call: CallbackQuery):
+async def back_to_main(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
+    await state.clear()
     await call.message.edit_text("🔧 <b>АДМИН-ПАНЕЛЬ</b>", reply_markup=admin_menu())
+
+
+# ==== БАЗА ДАННЫХ ====
+@router.callback_query(F.data == "db_menu")
+async def db_menu_handler(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+
+    size = "—"
+    if os.path.exists(DB_PATH):
+        size = f"{os.path.getsize(DB_PATH) / 1024:.1f} KB"
+
+    text = (
+        "🗄 <b>БАЗА ДАННЫХ</b>\n\n"
+        f"Файл: <code>{DB_PATH}</code>\n"
+        f"Размер: {size}\n\n"
+        "📥 <b>Скачать</b> — получить текущую БД\n"
+        "📤 <b>Загрузить</b> — заменить БД из файла\n\n"
+        "⚠️ Перед загрузкой сделай резервную копию!"
+    )
+    await call.message.edit_text(text, reply_markup=db_menu())
+
+
+# ==== Скачать БД ====
+@router.callback_query(F.data == "db_download")
+async def db_download(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return
+
+    if not os.path.exists(DB_PATH):
+        await call.answer("Файл БД не найден", show_alert=True)
+        return
+
+    try:
+        file = FSInputFile(DB_PATH, filename="bot.db")
+        await call.message.answer_document(file, caption="📥 База данных бота")
+        await call.answer("Отправлено!")
+    except Exception as e:
+        await call.answer(f"Ошибка: {e}", show_alert=True)
+
+
+# ==== Загрузить БД ====
+@router.callback_query(F.data == "db_upload")
+async def db_upload(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+
+    await call.message.edit_text(
+        "📤 <b>ЗАГРУЗКА БД</b>\n\n"
+        "Отправь мне файл <code>bot.db</code> одним сообщением.\n\n"
+        "⚠️ Текущая БД будет заменена!\n"
+        "Убедись, что у тебя есть резервная копия."
+    )
+    await state.set_state(DBStates.waiting_file)
+
+
+@router.message(DBStates.waiting_file, F.document)
+async def db_receive(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    doc = message.document
+    if not doc.file_name.endswith(".db"):
+        await message.answer("❌ Нужен файл с расширением <code>.db</code>")
+        return
+
+    # Делаем бэкап старой БД
+    backup = DB_PATH + ".backup"
+    try:
+        if os.path.exists(DB_PATH):
+            shutil.copy(DB_PATH, backup)
+    except Exception as e:
+        print(f"[backup error] {e}")
+
+    # Сохраняем новую БД
+    try:
+        file = await message.bot.get_file(doc.file_id)
+        await message.bot.download_file(file.file_path, DB_PATH)
+        await message.answer(
+            "✅ <b>БД загружена!</b>\n\n"
+            f"Бэкап старой БД: <code>{backup}</code>\n\n"
+            "Перезапусти бота, чтобы изменения точно применились.",
+            reply_markup=admin_menu()
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка загрузки: {e}")
+
+    await state.clear()
 
 
 # ==== Меню рекламы ====
@@ -68,7 +174,6 @@ async def ad_menu(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb)
 
 
-# ==== Добавить рекламу ====
 @router.callback_query(F.data == "ad_add")
 async def ad_add(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
@@ -89,7 +194,6 @@ async def ad_save(message: Message, state: FSMContext):
     await message.answer("✅ Реклама добавлена!", reply_markup=admin_menu())
 
 
-# ==== Удалить последнюю рекламу ====
 @router.callback_query(F.data == "ad_del")
 async def ad_del(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -104,7 +208,6 @@ async def ad_del(call: CallbackQuery):
     await ad_menu(call)
 
 
-# ==== Отправить сейчас ====
 @router.callback_query(F.data == "ad_send")
 async def ad_send(call: CallbackQuery):
     if not is_admin(call.from_user.id):
