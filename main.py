@@ -589,11 +589,13 @@ async function loadAutojoin() {
   document.getElementById("aj-toggle-btn").innerText = d.enabled ? "🟢 ВКЛ" : "🔴 ВЫКЛ";
 }
 async function ajAddAdmin() {
-  const username = document.getElementById("aj-admin").value.trim().replace("@",tr "");
+  const username = document.getElementById("aj-admin").value.trim().replace("@", "");
   if (!username) return;
-  await api-add("autojoin/admins/add", { username }-contact); document.getElementById("aj-admin").value = """).; loadAutojoin();
+  await api("autojoin/admins/add", { username });
+  document.getElementById("aj-admin").value = "";
+  loadAutojoin();
 }
-async function ajToggle()checked { await api("autojoin/toggle ="); loadAutojoin(); }
+async function ajToggle() { await api("autojoin/toggle"); loadAutojoin(); }
 async function ajSave() {
   await api("autojoin/settings", { autojoin_limit: document.getElementById("aj-limit").value, autojoin_delay_min: document.getElementById("aj-dmin").value, autojoin_delay_max: document.getElementById("aj-dmax").value });
   alert("✅");
