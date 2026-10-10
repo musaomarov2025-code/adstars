@@ -1,23 +1,19 @@
 import os
+from dotenv import load_dotenv
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_ЛОКАЛЬНО")
-ADMIN_ID = 8742164697
+load_dotenv()
 
-DB_PATH = "bot.db"
-CHIME_EVERY = 5
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
+DB_PATH = os.getenv("DB_PATH", "data.db")
+SESSION_PATH = os.getenv("SESSION_PATH", "sessions/user")
 
-FEMALE_NAMES = {
-    "аня", "анна", "маша", "мария", "катя", "екатерина", "лена", "елена",
-    "оля", "ольга", "настя", "анастасия", "ира", "ирина", "юля", "юлия",
-    "даша", "дарья", "соня", "софья", "вика", "виктория", "ника",
-    "лиза", "елизавета", "поля", "полина", "ксюша", "ксения", "алёна", "алена",
-    "таня", "татьяна", "света", "светлана", "наташа", "наталья", "люба", "любовь",
-    "вера", "надя", "надежда", "люда", "людмила", "галя", "галина", "нина",
-    "оксана", "альбина", "алина", "милана", "есения", "варя", "варвара",
-}
-
-MALE_EXCEPTIONS = {
-    "никита", "илья", "данила", "данил", "лёва", "лева", "миша", "саша",
-    "паша", "гриша", "вова", "дима", "коля", "ваня", "петя", "гоша", "лёша",
-    "леша", "федя", "сева", "боря", "слава", "толя", "вася", "костя", "руся",
-}
+# Дефолтные лимиты (можно менять в Mini App)
+DEFAULT_DAILY_LIMIT = 300
+DEFAULT_DELAY_MIN = 30
+DEFAULT_DELAY_MAX = 90
+DEFAULT_COOLDOWN = 60
+DEFAULT_REPEATS = 1
