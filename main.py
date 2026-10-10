@@ -7,15 +7,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 from config import BOT_TOKEN, WEBAPP_URL
 import database as db
 import telethon_client as tc
+from bot import webhook_handler, setup_webhook, remove_webhook
 
 
 # ==========================================================
-#  ПРОВЕРКА initData (авторизация Mini App)
+#  ПРОВЕРКА initData
 # ==========================================================
 def check_init_data(init_data: str) -> dict | None:
     if not init_data:
@@ -46,21 +46,37 @@ async def auth(request: Request):
 
 
 # ==========================================================
-#  LIFESPAN (запуск Telethon при старте)
+#  LIFESPAN
 # ==========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
     await tc.client.connect()
     if await tc.client.is_user_authorized():
-        print("✅ Telethon: аккаунт авторизован")
+        print("✅ Telethon: авторизован")
     else:
-        print("⚠️ Telethon: аккаунт НЕ авторизован")
+        print("⚠️ Telethon: НЕ авторизован")
+
+    # Установка webhook бота
+    if WEBAPP_URL:
+        try:
+            await setup_webhook(WEBAPP_URL)
+        except Exception as e:
+            print(f"Webhook setup error: {e}")
+
     yield
+
+    await remove_webhook()
     await tc.client.disconnect()
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ==========================================================
+#  WEBHOOK (Telegram)
+# ==========================================================
+app.post("/webhook")(webhook_handler)
 
 
 # ==========================================================
@@ -94,7 +110,7 @@ async def api_status(request: Request):
 
 
 # ==========================================================
-#  АВТОРИЗАЦИЯ АККАУНТА (вход в Telethon)
+#  АВТОРИЗАЦИЯ АККАУНТА
 # ==========================================================
 @app.post("/api/login/phone")
 async def login_phone(request: Request):
@@ -188,7 +204,7 @@ async def bc_settings_get(request: Request):
 
 
 # ==========================================================
-#  ЦЕЛИ (чаты)
+#  ЦЕЛИ
 # ==========================================================
 @app.post("/api/targets/add")
 async def targets_add(request: Request):
@@ -361,6 +377,6 @@ async def logs(request: Request):
 
 
 # ==========================================================
-#  СТАТИКА (Mini App)
+#  СТАТИКА
 # ==========================================================
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
