@@ -1,219 +1,252 @@
-import aiosqlite
+import sqlite3
 from config import DB_PATH
 
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS chats (
-                id INTEGER PRIMARY KEY,
-                title TEXT,
-                ad_enabled INTEGER DEFAULT 1,
-                mat_enabled INTEGER DEFAULT 1,
-                link TEXT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                name TEXT,
-                gender TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS ads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT,
-                media_type TEXT,
-                media_id TEXT,
-                order_num INTEGER DEFAULT 0
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS ad_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ad_id INTEGER,
-                chat_id INTEGER,
-                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
-        # Миграция: добавить колонку link, если её нет (для старых БД)
-        try:
-            await db.execute("ALTER TABLE chats ADD COLUMN link TEXT")
-        except Exception:
-            pass  # уже есть
-
-        await db.commit()
+def conn():
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
 
 
-# ==== ЧАТЫ ====
-async def add_chat(chat_id: int, title: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO chats (id, title) VALUES (?, ?)",
-            (chat_id, title)
-        )
-        await db.commit()
+def init():
+    c = conn()
+    cur = c.cursor()
+
+    # Настройки (лимиты, задержки, флаги вкл/выкл)
+    cur.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )""")
+
+    # Цели для рассылки (чаты, каналы)
+    cur.execute("""CREATE TABLE IF NOT EXISTS targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT UNIQUE,
+        title TEXT,
+        folder TEXT
+    )""")
+
+    # Тексты для рассылки
+    cur.execute("""CREATE TABLE IF NOT EXISTS texts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT
+    )""")
+
+    # Боты-админы для автоподписки
+    cur.execute("""CREATE TABLE IF NOT EXISTS admins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_username TEXT UNIQUE
+    )""")
+
+    # Триггерные слова
+    cur.execute("""CREATE TABLE IF NOT EXISTS triggers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        word TEXT UNIQUE
+    )""")
+
+    # Ответы на триггеры
+    cur.execute("""CREATE TABLE IF NOT EXISTS replies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT
+    )""")
+
+    # Контакты, которые уже добавлены (чтобы не добавлять повторно)
+    cur.execute("""CREATE TABLE IF NOT EXISTS added_contacts (
+        user_id INTEGER PRIMARY KEY
+    )""")
+
+    # Логи
+    cur.execute("""CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time TEXT,
+        level TEXT,
+        text TEXT
+    )""")
+
+    # Счётчик за день
+    cur.execute("""CREATE TABLE IF NOT EXISTS daily_counter (
+        date TEXT PRIMARY KEY,
+        sent INTEGER DEFAULT 0
+    )""")
+
+    c.commit()
+    c.close()
 
 
-async def get_all_chats():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, title, ad_enabled, mat_enabled FROM chats"
-        ) as cur:
-            return await cur.fetchall()
+# --- settings ---
+def set(key, value):
+    c = conn()
+    c.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(value)))
+    c.commit(); c.close()
 
 
-async def toggle_chat_ad(chat_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE chats SET ad_enabled = 1 - ad_enabled WHERE id = ?",
-            (chat_id,)
-        )
-        await db.commit()
+def get(key, default=None):
+    c = conn()
+    r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    c.close()
+    return r["value"] if r else default
 
 
-async def set_chat_mat(chat_id: int, enabled: bool):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE chats SET mat_enabled = ? WHERE id = ?",
-            (1 if enabled else 0, chat_id)
-        )
-        await db.commit()
+# --- targets ---
+def add_target(chat_id, title="", folder=""):
+    c = conn()
+    try:
+        c.execute("INSERT INTO targets (chat_id, title, folder) VALUES (?,?,?)",
+                  (str(chat_id), title, folder))
+        c.commit()
+    except sqlite3.IntegrityError:
+        pass
+    c.close()
 
 
-async def is_mat_enabled(chat_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT mat_enabled FROM chats WHERE id = ?", (chat_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return bool(row[0]) if row else True
+def del_target(chat_id):
+    c = conn()
+    c.execute("DELETE FROM targets WHERE chat_id=?", (str(chat_id),))
+    c.commit(); c.close()
 
 
-# ==== ССЫЛКИ НА ЧАТЫ ====
-async def set_chat_link(chat_id: int, link: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE chats SET link = ? WHERE id = ?",
-            (link, chat_id)
-        )
-        await db.commit()
+def all_targets():
+    c = conn()
+    r = c.execute("SELECT chat_id FROM targets").fetchall()
+    c.close()
+    return [row["chat_id"] for row in r]
 
 
-async def get_chat_link(chat_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT link FROM chats WHERE id = ?", (chat_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row and row[0] else None
+# --- texts ---
+def add_text(content):
+    c = conn()
+    c.execute("INSERT INTO texts (content) VALUES (?)", (content,))
+    c.commit(); c.close()
 
 
-# ==== ЮЗЕРЫ ====
-async def save_user(user_id: int, name: str, gender: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO users (id, name, gender) VALUES (?, ?, ?)",
-            (user_id, name, gender)
-        )
-        await db.commit()
+def all_texts():
+    c = conn()
+    r = c.execute("SELECT content FROM texts").fetchall()
+    c.close()
+    return [row["content"] for row in r]
 
 
-async def get_user_gender(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT gender FROM users WHERE id = ?", (user_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else None
+def del_text(tid):
+    c = conn()
+    c.execute("DELETE FROM texts WHERE id=?", (tid,))
+    c.commit(); c.close()
 
 
-# ==== РЕКЛАМА ====
-async def add_ad(text: str, media_type: str = None, media_id: str = None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT MAX(order_num) FROM ads") as cur:
-            row = await cur.fetchone()
-            next_num = (row[0] or 0) + 1
-        await db.execute(
-            "INSERT INTO ads (text, media_type, media_id, order_num) VALUES (?, ?, ?, ?)",
-            (text, media_type, media_id, next_num)
-        )
-        await db.commit()
+# --- admins (автоподписка) ---
+def add_admin(username):
+    c = conn()
+    try:
+        c.execute("INSERT INTO admins (bot_username) VALUES (?)", (username,))
+        c.commit()
+    except sqlite3.IntegrityError:
+        pass
+    c.close()
 
 
-async def get_all_ads():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, text, media_type, media_id, order_num FROM ads ORDER BY order_num"
-        ) as cur:
-            return await cur.fetchall()
+def all_admins():
+    c = conn()
+    r = c.execute("SELECT bot_username FROM admins").fetchall()
+    c.close()
+    return [row["bot_username"] for row in r]
 
 
-async def delete_ad(ad_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM ads WHERE id = ?", (ad_id,))
-        await db.commit()
+def del_admin(aid):
+    c = conn()
+    c.execute("DELETE FROM admins WHERE id=?", (aid,))
+    c.commit(); c.close()
 
 
-async def get_next_ad():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM ads") as cur:
-            count = (await cur.fetchone())[0]
-        if count == 0:
-            return None
-
-        async with db.execute(
-            "SELECT value FROM settings WHERE key = 'last_ad_index'"
-        ) as cur:
-            row = await cur.fetchone()
-            last = int(row[0]) if row else -1
-
-        next_index = (last + 1) % count
-
-        async with db.execute(
-            "SELECT id, text, media_type, media_id FROM ads ORDER BY order_num LIMIT 1 OFFSET ?",
-            (next_index,)
-        ) as cur:
-            ad = await cur.fetchone()
-
-        await db.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_ad_index', ?)",
-            (str(next_index),)
-        )
-        await db.commit()
-        return ad
+# --- triggers ---
+def add_trigger(word):
+    c = conn()
+    try:
+        c.execute("INSERT INTO triggers (word) VALUES (?)", (word.lower(),))
+        c.commit()
+    except sqlite3.IntegrityError:
+        pass
+    c.close()
 
 
-async def log_ad(ad_id: int, chat_id: int, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO ad_log (ad_id, chat_id, status) VALUES (?, ?, ?)",
-            (ad_id, chat_id, status)
-        )
-        await db.commit()
+def all_triggers():
+    c = conn()
+    r = c.execute("SELECT word FROM triggers").fetchall()
+    c.close()
+    return [row["word"] for row in r]
 
 
-# ==== СТАТИСТИКА ====
-async def get_stats():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM chats") as cur:
-            chats = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            users = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM ads") as cur:
-            ads = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT COUNT(*) FROM ad_log WHERE status = 'ok'"
-        ) as cur:
-            sent = (await cur.fetchone())[0]
-        return {"chats": chats, "users": users, "ads": ads, "sent": sent}
+def del_trigger(tid):
+    c = conn()
+    c.execute("DELETE FROM triggers WHERE id=?", (tid,))
+    c.commit(); c.close()
+
+
+# --- replies ---
+def add_reply(content):
+    c = conn()
+    c.execute("INSERT INTO replies (content) VALUES (?)", (content,))
+    c.commit(); c.close()
+
+
+def all_replies():
+    c = conn()
+    r = c.execute("SELECT content FROM replies").fetchall()
+    c.close()
+    return [row["content"] for row in r]
+
+
+def del_reply(rid):
+    c = conn()
+    c.execute("DELETE FROM replies WHERE id=?", (rid,))
+    c.commit(); c.close()
+
+
+# --- added contacts ---
+def is_contact_added(user_id):
+    c = conn()
+    r = c.execute("SELECT 1 FROM added_contacts WHERE user_id=?", (user_id,)).fetchone()
+    c.close()
+    return r is not None
+
+
+def mark_contact(user_id):
+    c = conn()
+    c.execute("INSERT OR IGNORE INTO added_contacts (user_id) VALUES (?)", (user_id,))
+    c.commit(); c.close()
+
+
+# --- logs ---
+def log(level, text):
+    from datetime import datetime
+    c = conn()
+    c.execute("INSERT INTO logs (time, level, text) VALUES (?,?,?)",
+              (datetime.now().strftime("%H:%M:%S"), level, text))
+    c.commit(); c.close()
+
+
+def get_logs(limit=50):
+    c = conn()
+    r = c.execute("SELECT time, level, text FROM logs ORDER BY id DESC LIMIT ?",
+                  (limit,)).fetchall()
+    c.close()
+    return [dict(row) for row in r]
+
+
+# --- daily counter ---
+def today():
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def inc_sent():
+    c = conn()
+    d = today()
+    c.execute("INSERT OR IGNORE INTO daily_counter (date, sent) VALUES (?,0)", (d,))
+    c.execute("UPDATE daily_counter SET sent = sent + 1 WHERE date=?", (d,))
+    c.commit(); c.close()
+
+
+def get_sent_today():
+    c = conn()
+    r = c.execute("SELECT sent FROM daily_counter WHERE date=?", (today(),)).fetchone()
+    c.close()
+    return r["sent"] if r else 0
