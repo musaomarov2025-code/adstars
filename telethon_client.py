@@ -1,7 +1,6 @@
 import asyncio
 import random
-from datetime import datetime
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, events, functions
 from telethon.errors import (
     FloodWaitError, PeerFloodError, UserAlreadyParticipantError,
     ChannelPrivateError, UsernameInvalidError, ContactNameEmptyError,
@@ -12,25 +11,21 @@ import database as db
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 
-# Флаги для управления из Mini App
+# Флаги управления
 broadcast_running = False
 autojoin_running = True
 autotrigger_running = True
 
 
 # ==========================================================
-#  УВЕДОМЛЕНИЯ ВЛАДЕЛЬЦУ
+#  УВЕДОМЛЕНИЯ (через bot.py)
 # ==========================================================
 async def notify(text, level="info"):
-    """Отправляет уведомление тебе в ЛС от управляющего бота."""
+    from bot import send_notify
     db.log(level, text)
+    emoji = {"info": "ℹ️", "warn": "⚠️", "error": "❌", "restrict": "🚫"}.get(level, "ℹ️")
     try:
-        from aiogram import Bot
-        from config import BOT_TOKEN, OWNER_ID
-        bot = Bot(token=BOT_TOKEN)
-        emoji = {"info": "ℹ️", "warn": "⚠️", "error": "❌", "restrict": "🚫"}.get(level, "ℹ️")
-        await bot.send_message(OWNER_ID, f"{emoji} {text}")
-        await bot.session.close()
+        await send_notify(f"{emoji} {text}")
     except Exception as e:
         print(f"Notify error: {e}")
 
@@ -55,11 +50,9 @@ async def autojoin_handler(event):
         links = [w for w in text.split() if "t.me/" in w or "joinchat" in w]
 
         for link in links:
-            # Проверка лимита
             limit = int(db.get("autojoin_limit", 5))
-            sent = db.get_sent_today()
-            if sent >= limit:
-                await notify(f"Автоподписка: дневной лимит {limit} достигнут", "warn")
+            if db.get_sent_today() >= limit:
+                await notify(f"Автоподписка: лимит {limit} достигнут", "warn")
                 return
 
             try:
@@ -69,14 +62,14 @@ async def autojoin_handler(event):
             except UserAlreadyParticipantError:
                 pass
             except FloodWaitError as e:
-                await notify(f"FloodWait {e.seconds} сек (подписка)", "warn")
+                await notify(f"FloodWait {e.seconds}с (подписка)", "warn")
                 await asyncio.sleep(e.seconds)
             except (ChannelPrivateError, UsernameInvalidError):
                 await notify(f"Не смог подписаться: {link}", "error")
 
-            delay_min = int(db.get("autojoin_delay_min", 30))
-            delay_max = int(db.get("autojoin_delay_max", 90))
-            await asyncio.sleep(random.randint(delay_min, delay_max))
+            dmin = int(db.get("autojoin_delay_min", 30))
+            dmax = int(db.get("autojoin_delay_max", 90))
+            await asyncio.sleep(random.randint(dmin, dmax))
 
     except Exception as e:
         await notify(f"Ошибка автоподписки: {e}", "error")
@@ -98,24 +91,21 @@ async def autotrigger_handler(event):
             return
 
         triggers = [t.lower() for t in db.all_triggers()]
-        if not any(t in text for t in triggers):
+        if not triggers or not any(t in text for t in triggers):
             return
 
         sender = await event.get_sender()
         if not sender:
             return
 
-        # Задержка перед ответом (настраивается)
         dmin = int(db.get("trigger_delay_min", 5))
         dmax = int(db.get("trigger_delay_max", 30))
         await asyncio.sleep(random.randint(dmin, dmax))
 
-        # Ответ (рандом)
         replies = db.all_replies()
         if not replies:
             return
-        reply = random.choice(replies)
-        await event.reply(reply)
+        await event.reply(random.choice(replies))
 
         # Добавление в контакты
         if db.get("trigger_add_contact", "1") == "1":
@@ -131,11 +121,11 @@ async def autotrigger_handler(event):
                     db.mark_contact(sender.id)
                     await notify(f"Добавлен в контакты: {sender.first_name}", "info")
                 except ContactNameEmptyError:
-                    await notify("Не смог добавить: пустое имя", "warn")
+                    await notify("Контакты: пустое имя", "warn")
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds)
                 except Exception as e:
-                    await notify(f"Ошибка добавления в контакты: {e}", "error")
+                    await notify(f"Ошибка добавления: {e}", "error")
 
     except Exception as e:
         await notify(f"Ошибка автотриггера: {e}", "error")
@@ -161,7 +151,7 @@ async def run_broadcast():
     cooldown = int(db.get("bc_cooldown", 60))
     daily_limit = int(db.get("bc_daily_limit", 300))
 
-    await notify(f"Рассылка запущена: {len(targets)} чатов × {repeats}", "info")
+    await notify(f"Рассылка: {len(targets)} чатов × {repeats}", "info")
 
     try:
         for r in range(repeats):
@@ -173,28 +163,27 @@ async def run_broadcast():
                     break
 
                 if db.get_sent_today() >= daily_limit:
-                    await notify(f"Дневной лимит {daily_limit} достигнут", "warn")
+                    await notify(f"Лимит {daily_limit} достигнут", "warn")
                     broadcast_running = False
                     return
 
                 try:
-                    text = random.choice(texts)
-                    await client.send_message(chat_id, text)
+                    await client.send_message(chat_id, random.choice(texts))
                     db.inc_sent()
                     db.log("info", f"Отправлено: {chat_id}")
 
                 except FloodWaitError as e:
-                    await notify(f"FloodWait {e.seconds} сек", "warn")
+                    await notify(f"FloodWait {e.seconds}с", "warn")
                     await asyncio.sleep(e.seconds)
                 except PeerFloodError:
-                    await notify("🚫 Аккаунт получил ограничение! Рассылка остановлена", "restrict")
+                    await notify("🚫 Аккаунт получил ограничение! Стоп", "restrict")
                     broadcast_running = False
                     return
                 except (ChatWriteForbiddenError, ChannelPrivateError):
                     db.del_target(chat_id)
-                    await notify(f"Удалён из списка (нет доступа): {chat_id}", "error")
+                    await notify(f"Удалён (нет доступа): {chat_id}", "error")
                 except Exception as e:
-                    await notify(f"Ошибка отправки в {chat_id}: {e}", "error")
+                    await notify(f"Ошибка {chat_id}: {e}", "error")
 
                 await asyncio.sleep(random.randint(dmin, dmax))
 
@@ -204,7 +193,7 @@ async def run_broadcast():
         await notify("Рассылка завершена", "info")
 
     except Exception as e:
-        await notify(f"Критическая ошибка рассылки: {e}", "error")
+        await notify(f"Критическая ошибка: {e}", "error")
     finally:
         broadcast_running = False
 
