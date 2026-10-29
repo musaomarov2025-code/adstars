@@ -1,3 +1,5 @@
 aiogram>=3.17,<4
 openai>=1.0,<2
 python-dotenv
+aiohttp
+beautifulsoup4
