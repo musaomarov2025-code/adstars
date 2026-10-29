@@ -35,21 +35,19 @@ client = AsyncOpenAI(
     timeout=120.0 
 )
 
-# ЖЕСТКИЙ ПРОМПТ, ЧТОБЫ ОН НЕ ТУПИЛ И НЕ ПРОСИЛ ТЕКСТ ЗАНОВО
-SYSTEM_PROMPT = (
+# Базовый промпт
+BASE_SYSTEM_PROMPT = (
     "Ты — профессиональный программист и ИИ-ассистент. "
-    "Твоя главная задача — писать код, разбирать ошибки и создавать проекты. "
-    "ВАЖНО: Если пользователь присылает длинный текст, список или техническое задание (ТЗ), ты ОБЯЗАН внимательно его прочитать и сразу выдать ответ. "
-    "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать 'Пришлите текст', 'Я не вижу текст' или 'Напишите, что должен делать бот', если текст УЖЕ ЕСТЬ в сообщении. "
-    "Если тебе прислали ТЗ, проанализируй его и выдай структуру проекта, либо начни писать код. "
+    "Отвечай кратко, без воды. "
     "ФОРМАТИРОВАНИЕ: ВСЕГДА оборачивай код в Markdown-блоки с указанием имени файла. Пример: ```python filename=\"main.py\"\nprint('hi')\n```. "
     "Если файлов несколько, используй отдельный блок для каждого. Никогда не пиши 'я не могу создать файл'. "
-    "Отвечай без воды, кратко и по делу. Пиши на русском."
+    "Пиши на русском."
 )
 
-# --- БАЗА ДАННЫХ (ПАМЯТЬ) ---
+# --- БАЗА ДАННЫХ (ПАМЯТЬ И ПРАВИЛА) ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
+        # Таблица истории
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,6 +55,14 @@ async def init_db():
                 role TEXT,
                 content TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Таблица правил (обучения)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                rule_text TEXT
             )
         """)
         await db.commit()
@@ -69,7 +75,7 @@ async def add_to_history(user_id: int, role: str, content: str):
         )
         await db.commit()
 
-async def get_history(user_id: int, limit: int = 30):
+async def get_history(user_id: int, limit: int = 20):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute(
             "SELECT role, content FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
@@ -83,12 +89,35 @@ async def clear_history(user_id: int):
         await db.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
         await db.commit()
 
-# --- ЧТЕНИЕ ССЫЛОК (С ПОДДЕРЖКОЙ TELEGRAM) ---
+# --- УПРАВЛЕНИЕ ПРАВИЛАМИ (САМООБУЧЕНИЕ) ---
+async def add_rule(user_id: int, rule_text: str):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT INTO rules (user_id, rule_text) VALUES (?, ?)", (user_id, rule_text))
+        await db.commit()
+
+async def get_rules(user_id: int) -> str:
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT rule_text FROM rules WHERE user_id = ?", (user_id,))
+        rows = await cursor.fetchall()
+        if not rows:
+            return ""
+        rules = "\n".join([f"- {row[0]}" for row in rows])
+        return f"\n\nВАЖНЫЕ ПРАВИЛА ОТ ПОЛЬЗОВАТЕЛЯ (ОБЯЗАТЕЛЬНЫ К ИСПОЛНЕНИЮ):\n{rules}"
+
+async def clear_rules(user_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM rules WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+async def list_rules(user_id: int) -> list:
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT id, rule_text FROM rules WHERE user_id = ?", (user_id,))
+        return await cursor.fetchall()
+
+# --- ЧТЕНИЕ ССЫЛОК ---
 async def fetch_url_text(url: str) -> str:
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        
-        # Превращаем t.me/название/пост в t.me/s/название/пост (веб-версия с текстом)
         if "t.me/" in url and "/s/" not in url:
             url = url.replace("t.me/", "t.me/s/")
 
@@ -97,13 +126,14 @@ async def fetch_url_text(url: str) -> str:
                 html = await response.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # Если это Telegram, ищем конкретный блок с текстом поста
                 if "t.me" in url:
-                    message_text = soup.find("div", class_="tgme_widget_message_text")
-                    if message_text:
-                        return message_text.get_text(separator='\n', strip=True)
+                    messages = soup.find_all("div", class_="tgme_widget_message_text")
+                    if messages:
+                        full_text = "\n".join([msg.get_text(separator='\n', strip=True) for msg in messages])
+                        if len(full_text) > 20:
+                            return full_text
+                    return "[Ошибка: Telegram заблокировал чтение. Пришли текст файлом или сообщением]"
                 
-                # Для обычных сайтов
                 for script in soup(["script", "style", "noscript"]): script.extract()
                 text = ' '.join(soup.get_text(separator=' ').split())
                 return text[:8000]
@@ -126,12 +156,10 @@ async def send_code_files(message: Message, answer: str):
     matches = re.findall(pattern, answer, re.DOTALL)
     clean_text = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
     
-    # Отправляем текст без кода
     if clean_text:
         for chunk in split_long_text(clean_text):
             await message.answer(chunk)
 
-    # Отправляем файлы
     if matches:
         for m in matches:
             lang, custom_filename, default_lang, code = m
@@ -152,8 +180,12 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
     except: pass
 
     try:
-        history = await get_history(user_id, limit=30)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+        # Берем базовый промпт и ДОБАВЛЯЕМ правила, которым он научился
+        user_rules = await get_rules(user_id)
+        final_system_prompt = BASE_SYSTEM_PROMPT + user_rules
+        
+        history = await get_history(user_id, limit=20)
+        messages = [{"role": "system", "content": final_system_prompt}] + history
         
         response = await client.chat.completions.create(
             model=MODEL_ID,
@@ -184,13 +216,45 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! Я твой ИИ-разработчик.\n\n"
-        "Скидывай мне ТЗ, ссылки на посты в ТГ, файлы или фото. Я всё прочитаю и выдам готовый код файлами."
+        "🧠 **Я умею учиться на своих ошибках.**\n"
+        "Если я тупанул, напиши команду `/rule [как надо было сделать]`.\n"
+        "Например: `/rule Если я присылаю ссылку на ТГ, не говори что не видишь текст, а ищи класс tgme_widget_message_text`.\n\n"
+        "Команды:\n"
+        "/rules — посмотреть мои правила\n"
+        "/clear — очистить память диалога\n"
+        "/forget_rules — удалить все правила"
     )
 
 @router.message(Command("clear"))
 async def cmd_clear(message: Message):
     await clear_history(message.from_user.id)
-    await message.answer("🧹 Память полностью очищена. Можем начать заново.")
+    await message.answer("🧹 История диалога очищена. Но я всё ещё помню твои правила (/rules).")
+
+@router.message(Command("rule"))
+async def cmd_add_rule(message: Message):
+    rule_text = message.text.replace("/rule", "").strip()
+    if not rule_text:
+        await message.answer("Напиши правило после команды. Пример: `/rule Всегда пиши код с комментариями`")
+        return
+    await add_rule(message.from_user.id, rule_text)
+    await message.answer(f"🧠 Запомнил новое правило:\n_{rule_text}_\n\nТеперь я буду это учитывать.", parse_mode="Markdown")
+
+@router.message(Command("rules"))
+async def cmd_list_rules(message: Message):
+    rules = await list_rules(message.from_user.id)
+    if not rules:
+        await message.answer("У меня пока нет правил. Напиши `/rule [текст]`, чтобы обучить меня.")
+        return
+    
+    text = "📋 **Твои правила (чему я научился):**\n\n"
+    for r_id, r_text in rules:
+        text += f"{r_id}. {r_text}\n"
+    await message.answer(text, parse_mode="Markdown")
+
+@router.message(Command("forget_rules"))
+async def cmd_forget_rules(message: Message):
+    await clear_rules(message.from_user.id)
+    await message.answer("🧹 Я забыл все правила. Теперь я чистый лист.")
 
 # --- ФОТО ---
 @router.message(F.photo)
@@ -206,9 +270,12 @@ async def handle_photo(message: Message):
         caption = message.caption or "Разбери этот скриншот."
         await add_to_history(user_id, "user", f"[Фото]: {caption}")
         
-        history = await get_history(user_id, limit=15)
+        user_rules = await get_rules(user_id)
+        final_system_prompt = BASE_SYSTEM_PROMPT + user_rules
+        
+        history = await get_history(user_id, limit=10)
         content = [{"type": "text", "text": caption}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": content}]
+        messages = [{"role": "system", "content": final_system_prompt}] + history + [{"role": "user", "content": content}]
         
         response = await client.chat.completions.create(model=MODEL_ID, messages=messages, max_tokens=4000)
         answer = response.choices[0].message.content
@@ -258,7 +325,7 @@ async def handle_document(message: Message):
             await message.answer("Файл пустой.")
             return
 
-        caption = message.caption or 'Проанализируй этот файл/код и напиши, что с ним не так, или доработай.'
+        caption = message.caption or 'Проанализируй этот файл/код.'
         prompt = f"Файл `{document.file_name}`:\n\n```\n{extracted_text[:25000]}\n```\n\n{caption}"
         
         await add_to_history(user_id, "user", prompt)
