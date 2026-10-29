@@ -15,13 +15,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 XEROSHARC_API_KEY = os.getenv("XEROSHARC_API_KEY")
 XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1")
 
 if not BOT_TOKEN or not XEROSHARC_API_KEY:
-    raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY")
+    raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY в переменных окружения")
 
+# Список моделей (согласно вашему скриншоту)
 MODELS = {
     "claude-haiku": {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5 (Быстрая)"},
     "claude-sonnet": {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Средняя)"},
@@ -29,19 +31,14 @@ MODELS = {
     "gpt-6": {"id": "gpt-6.1-sol", "name": "GPT-6.1 Sol"},
 }
 
-DEFAULT_MODEL_KEY = "claude-sonnet"
+DEFAULT_MODEL_KEY = "claude-sonnet" # Модель по умолчанию
 
+# Хранилища в памяти (сбрасываются при перезапуске)
 user_histories = defaultdict(list)
 user_models = {}
 MAX_HISTORY_LENGTH = 10
 
-router = Router()
-client = AsyncOpenAI(
-    api_key=XEROSHARC_API_KEY,
-    base_url=XEROSHARC_BASE_URL,
-)
-
-# Расширения файлов для отправки
+# Расширения файлов для отправки кода
 EXTENSIONS = {
     "python": "py", "py": "py", "javascript": "js", "js": "js",
     "typescript": "ts", "ts": "ts", "html": "html", "css": "css",
@@ -49,17 +46,21 @@ EXTENSIONS = {
     "cpp": "cpp", "c": "c", "java": "java", "go": "go", "php": "php",
 }
 
+router = Router()
+client = AsyncOpenAI(
+    api_key=XEROSHARC_API_KEY,
+    base_url=XEROSHARC_BASE_URL,
+)
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 class ModelCallback(CallbackData, prefix="model"):
     key: str
-
 
 def get_model_name(key: str) -> str:
     return MODELS.get(key, {}).get("name", key)
 
-
 def get_model_key(user_id: int) -> str:
     return user_models.get(user_id, DEFAULT_MODEL_KEY)
-
 
 def model_keyboard(current_key: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -72,6 +73,15 @@ def model_keyboard(current_key: str) -> InlineKeyboardMarkup:
     builder.adjust(1)
     return builder.as_markup()
 
+# --- ОБРАБОТЧИКИ КОМАНД ---
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "Привет! Я бот-ассистент.\n"
+        "Просто напиши мне вопрос, и я отвечу.\n"
+        "Если попросишь код — я пришлю его файлом.\n\n"
+        "Сменить модель: /model"
+    )
 
 @router.message(Command("model"))
 async def cmd_model(message: Message):
@@ -82,7 +92,6 @@ async def cmd_model(message: Message):
         reply_markup=model_keyboard(current_key),
         parse_mode="Markdown",
     )
-
 
 @router.callback_query(ModelCallback.filter())
 async def process_model_choice(callback: CallbackQuery, callback_data: ModelCallback):
@@ -101,7 +110,7 @@ async def process_model_choice(callback: CallbackQuery, callback_data: ModelCall
     )
     await callback.answer(f"Выбрана модель: {get_model_name(new_key)}")
 
-
+# --- ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
 @router.message(F.text)
 async def handle_message(message: Message):
     user_id = message.from_user.id
@@ -109,6 +118,7 @@ async def handle_message(message: Message):
     model_key = get_model_key(user_id)
     model_id = MODELS[model_key]["id"]
 
+    # Добавляем сообщение пользователя в историю
     user_histories[user_id].append({"role": "user", "content": user_text})
     if len(user_histories[user_id]) > MAX_HISTORY_LENGTH:
         user_histories[user_id] = user_histories[user_id][-MAX_HISTORY_LENGTH:]
@@ -116,14 +126,19 @@ async def handle_message(message: Message):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     try:
+        # Системный промпт передается как первое сообщение в списке
+        messages_for_api = [
+            {"role": "system", "content": "Ты полезный ассистент. Отвечай на русском. Если пользователь просит написать код, ВСЕГДА оборачивай его в блоки markdown с указанием языка (например ```python)."}
+        ] + user_histories[user_id]
+
         response = await client.chat.completions.create(
             model=model_id,
-            messages=user_histories[user_id],
-            # Системный промпт для управления поведением
-            system="Ты полезный ассистент. Отвечай на русском. Если пользователь просит написать код, ВСЕГДА оборачивай его в блоки markdown с указанием языка (например ```python).",
-            max_tokens=2048, # Увеличил лимит, чтобы влезали полноценные файлы
+            messages=messages_for_api,
+            max_tokens=2048,
         )
         answer = response.choices[0].message.content
+        
+        # Сохраняем ответ в историю
         user_histories[user_id].append({"role": "assistant", "content": answer})
         
         # --- ЛОГИКА ОТПРАВКИ ФАЙЛОВ ---
@@ -131,7 +146,6 @@ async def handle_message(message: Message):
         code_blocks = re.findall(r"```(\w*)\n(.*?)```", answer, re.DOTALL)
         
         if code_blocks:
-            # Если код найден, отправляем сообщение-подпись и сам файл
             await message.answer("Вот ваш код, я упаковал его в файл 👇")
             
             for i, (lang, code) in enumerate(code_blocks):
@@ -157,14 +171,14 @@ async def handle_message(message: Message):
         logging.exception("Ошибка при запросе к API")
         await message.answer(f"Произошла ошибка: {e}")
 
-
+# --- ЗАПУСК БОТА ---
 async def main():
     logging.basicConfig(level=logging.INFO)
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    print("Бот запущен и готов к работе!")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
