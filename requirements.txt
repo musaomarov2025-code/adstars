@@ -4,3 +4,4 @@ python-dotenv
 aiohttp
 beautifulsoup4
 pypdf
+aiosqlite
