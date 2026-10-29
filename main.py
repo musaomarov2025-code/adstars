@@ -32,19 +32,34 @@ router = Router()
 client = AsyncOpenAI(
     api_key=XEROSHARC_API_KEY, 
     base_url=XEROSHARC_BASE_URL,
-    timeout=120.0 
+    timeout=180.0 # Ждем ответа до 3 минут (для огромных текстов)
 )
 
-# Базовый промпт
+# ЖЕСТКИЙ ПРОМПТ: Указываем нейросети, что использовать ТОЛЬКО Markdown
 BASE_SYSTEM_PROMPT = (
     "Ты — профессиональный программист и ИИ-ассистент. "
-    "Отвечай кратко, без воды. "
-    "ФОРМАТИРОВАНИЕ: ВСЕГДА оборачивай код в Markdown-блоки с указанием имени файла. Пример: ```python filename=\"main.py\"\nprint('hi')\n```. "
-    "Если файлов несколько, используй отдельный блок для каждого. Никогда не пиши 'я не могу создать файл'. "
-    "Пиши на русском."
+    "ВНИМАНИЕ: Твой бэкенд (бот) уже скачал текст по ссылке и передал его тебе. "
+    "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать 'я не могу читать ссылки', 'я вижу только половину' или давать инструкции по API. "
+    "Если в сообщении есть текст, извлеченный по ссылке, просто прочитай его и ответь по сути. "
+    "ФОРМАТИРОВАНИЕ: Отвечай с использованием Markdown. Для жирного текста используй **текст**, для курсива *текст*. "
+    "ВСЕГДА оборачивай код в блоки с указанием имени файла. Пример: ```python filename=\"main.py\"\nprint('hi')\n```. "
+    "Если файлов несколько, используй отдельный блок для каждого. Пиши на русском, без воды."
 )
 
-# --- БАЗА ДАННЫХ ---
+# --- БЕЗОПАСНАЯ ОТПРАВКА СООБЩЕНИЙ (ЧТОБЫ НЕ БЫЛО ЗВЕЗДОЧЕК) ---
+async def safe_answer(message: Message, text: str):
+    if not text.strip(): return
+    try:
+        # Пытаемся отправить красиво с Markdown (жирный шрифт, курсив)
+        await message.answer(text, parse_mode="Markdown")
+    except Exception:
+        try:
+            # Если Telegram ругается на кривую разметку от ИИ, отправляем чистый текст
+            await message.answer(text)
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение: {e}")
+
+# --- БАЗА ДАННЫХ (ПАМЯТЬ И ПРАВИЛА) ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -70,7 +85,7 @@ async def add_to_history(user_id: int, role: str, content: str):
         await db.execute("INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)", (user_id, role, content))
         await db.commit()
 
-async def get_history(user_id: int, limit: int = 20):
+async def get_history(user_id: int, limit: int = 50): # Память увеличена до 50 сообщений
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT role, content FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
         rows = await cursor.fetchall()
@@ -81,7 +96,6 @@ async def clear_history(user_id: int):
         await db.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
         await db.commit()
 
-# --- ПРАВИЛА (САМООБУЧЕНИЕ) ---
 async def add_rule(user_id: int, rule_text: str):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("INSERT INTO rules (user_id, rule_text) VALUES (?, ?)", (user_id, rule_text))
@@ -93,7 +107,7 @@ async def get_rules(user_id: int) -> str:
         rows = await cursor.fetchall()
         if not rows: return ""
         rules = "\n".join([f"- {row[0]}" for row in rows])
-        return f"\n\nВАЖНЫЕ ПРАВИЛА ОТ ПОЛЬЗОВАТЕЛЯ (ОБЯЗАТЕЛЬНЫ К ИСПОЛНЕНИЮ):\n{rules}"
+        return f"\n\nВАЖНЫЕ ПРАВИЛА ОТ ПОЛЬЗОВАТЕЛЯ:\n{rules}"
 
 async def clear_rules(user_id: int):
     async with aiosqlite.connect(DB_FILE) as db:
@@ -105,22 +119,24 @@ async def list_rules(user_id: int) -> list:
         cursor = await db.execute("SELECT id, rule_text FROM rules WHERE user_id = ?", (user_id,))
         return await cursor.fetchall()
 
-# --- ПАРСИНГ ССЫЛОК (ЧЕРЕЗ JINA AI) ---
+# --- ПАРСИНГ ССЫЛОК (JINA AI) ---
 async def fetch_url_text(url: str) -> str:
     try:
-        # Jina AI превращает любую страницу в чистый текст (Markdown)
         jina_url = f"https://r.jina.ai/{url}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(jina_url, headers=headers, timeout=25) as response:
+            async with session.get(jina_url, headers=headers, timeout=60) as response:
                 if response.status == 200:
                     text = await response.text()
-                    return text[:10000] # Ограничиваем 10к символов
+                    # Ограничение поднято до 80 000 символов (огромные статьи/ТЗ)
+                    if len(text) > 80000:
+                        return text[:80000] + "\n\n[...Текст обрезан, так как он слишком длинный...]"
+                    return text
                 else:
-                    return f"[Ошибка чтения сайта. Код: {response.status}. Скинь текст файлом]"
+                    return f"[Ошибка: сайт заблокировал чтение. Скинь текст файлом]"
     except Exception as e:
-        return f"[Не удалось прочитать ссылку: {e}]"
+        return f"[Ошибка чтения ссылки: {e}]"
 
 # --- ОТПРАВКА КОДА ---
 def split_long_text(text: str, max_length: int = 4000) -> list:
@@ -140,7 +156,7 @@ async def send_code_files(message: Message, answer: str):
     
     if clean_text:
         for chunk in split_long_text(clean_text):
-            await message.answer(chunk)
+            await safe_answer(message, chunk) # Используем безопасную отправку
 
     if matches:
         for m in matches:
@@ -153,7 +169,7 @@ async def send_code_files(message: Message, answer: str):
             await message.answer_document(document=doc)
     elif not clean_text:
         for chunk in split_long_text(answer):
-            await message.answer(chunk)
+            await safe_answer(message, chunk)
 
 # --- ЗАПРОС К НЕЙРОСЕТИ ---
 async def process_ai_response(message: Message, user_id: int, status_msg: Message = None):
@@ -165,13 +181,13 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
         user_rules = await get_rules(user_id)
         final_system_prompt = BASE_SYSTEM_PROMPT + user_rules
         
-        history = await get_history(user_id, limit=20)
+        history = await get_history(user_id, limit=50)
         messages = [{"role": "system", "content": final_system_prompt}] + history
         
         response = await client.chat.completions.create(
             model=MODEL_ID,
             messages=messages,
-            max_tokens=4000,
+            max_tokens=8000, # Увеличено для написания длинных кодов
         )
         answer = response.choices[0].message.content
         await add_to_history(user_id, "assistant", answer)
@@ -197,13 +213,10 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! Я твой ИИ-разработчик.\n\n"
-        "🧠 **Я умею учиться на ошибках.**\n"
-        "Если я тупанул, напиши `/rule [как надо было сделать]`.\n"
-        "Например: `/rule Всегда пиши код с комментариями`.\n\n"
+        "Теперь я пишу красивым шрифтом, читаю огромные ссылки (до 80к символов) и помню 50 последних сообщений.\n\n"
         "Команды:\n"
         "/rules — мои правила\n"
-        "/clear — очистить память\n"
-        "/forget_rules — забыть правила"
+        "/clear — очистить память"
     )
 
 @router.message(Command("clear"))
@@ -234,7 +247,7 @@ async def cmd_list_rules(message: Message):
 @router.message(Command("forget_rules"))
 async def cmd_forget_rules(message: Message):
     await clear_rules(message.from_user.id)
-    await message.answer("🧹 Я забыл все правила. Теперь я чистый лист.")
+    await message.answer("🧹 Я забыл все правила.")
 
 # --- ФОТО ---
 @router.message(F.photo)
@@ -253,11 +266,11 @@ async def handle_photo(message: Message):
         user_rules = await get_rules(user_id)
         final_system_prompt = BASE_SYSTEM_PROMPT + user_rules
         
-        history = await get_history(user_id, limit=10)
+        history = await get_history(user_id, limit=20)
         content = [{"type": "text", "text": caption}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
         messages = [{"role": "system", "content": final_system_prompt}] + history + [{"role": "user", "content": content}]
         
-        response = await client.chat.completions.create(model=MODEL_ID, messages=messages, max_tokens=4000)
+        response = await client.chat.completions.create(model=MODEL_ID, messages=messages, max_tokens=8000)
         answer = response.choices[0].message.content
         await add_to_history(user_id, "assistant", answer)
         await status_msg.delete()
@@ -285,7 +298,7 @@ async def handle_document(message: Message):
         if document.file_name.lower().endswith('.pdf'):
             try:
                 reader = PdfReader(io.BytesIO(raw_data))
-                for page in reader.pages[:20]:
+                for page in reader.pages[:30]: # Увеличено до 30 страниц PDF
                     text = page.extract_text()
                     if text: extracted_text += text + "\n"
             except:
@@ -306,7 +319,8 @@ async def handle_document(message: Message):
             return
 
         caption = message.caption or 'Проанализируй этот файл/код.'
-        prompt = f"Файл `{document.file_name}`:\n\n```\n{extracted_text[:25000]}\n```\n\n{caption}"
+        # Увеличено до 80000 символов для чтения файлов
+        prompt = f"Файл `{document.file_name}`:\n\n```\n{extracted_text[:80000]}\n```\n\n{caption}"
         
         await add_to_history(user_id, "user", prompt)
         await process_ai_response(message, user_id, status_msg)
@@ -324,9 +338,10 @@ async def handle_text(message: Message):
     url_match = re.search(r'(https?://[^\s]+)', user_text)
     if url_match:
         url = url_match.group(1)
-        status_msg = await message.answer("⏳ Читаю сайт (через Jina AI)...")
+        status_msg = await message.answer("⏳ Выкачиваю текст по ссылке...")
         content = await fetch_url_text(url)
-        user_text = user_text.replace(url, f"\n[Текст по ссылке]:\n{content}\n")
+        
+        user_text = f"Пользователь прислал ссылку: {url}\n\nВот текст, который удалось с нее скачать:\n\n{content}\n\nВопрос пользователя: {user_text.replace(url, '')}"
     else:
         status_msg = await message.answer("⏳ Читаю и думаю...")
 
