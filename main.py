@@ -3,6 +3,8 @@ import io
 import logging
 import os
 import re
+import aiohttp
+from bs4 import BeautifulSoup
 from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -21,30 +23,20 @@ XEROSHARC_API_KEY = os.getenv("XEROSHARC_API_KEY")
 XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1")
 
 if not BOT_TOKEN or not XEROSHARC_API_KEY:
-    raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY в переменных окружения")
+    raise ValueError("Не заданы переменные окружения!")
 
-# Список моделей (согласно вашему скриншоту)
 MODELS = {
-    "claude-haiku": {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5 (Быстрая)"},
-    "claude-sonnet": {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Средняя)"},
+    "claude-sonnet": {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
     "claude-opus": {"id": "claude-opus-5-5", "name": "Claude Opus 5.5 (Умная)"},
     "gpt-6": {"id": "gpt-6.1-sol", "name": "GPT-6.1 Sol"},
 }
 
-DEFAULT_MODEL_KEY = "claude-sonnet" # Модель по умолчанию
+DEFAULT_MODEL_KEY = "claude-sonnet"
 
-# Хранилища в памяти (сбрасываются при перезапуске)
+# История хранится в памяти (сбрасывается при перезапуске BotHost)
 user_histories = defaultdict(list)
 user_models = {}
-MAX_HISTORY_LENGTH = 10
-
-# Расширения файлов для отправки кода
-EXTENSIONS = {
-    "python": "py", "py": "py", "javascript": "js", "js": "js",
-    "typescript": "ts", "ts": "ts", "html": "html", "css": "css",
-    "json": "json", "bash": "sh", "sh": "sh", "sql": "sql",
-    "cpp": "cpp", "c": "c", "java": "java", "go": "go", "php": "php",
-}
+MAX_HISTORY_LENGTH = 50  # Помним 50 последних сообщений
 
 router = Router()
 client = AsyncOpenAI(
@@ -52,7 +44,15 @@ client = AsyncOpenAI(
     base_url=XEROSHARC_BASE_URL,
 )
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+SYSTEM_PROMPT = (
+    "Ты senior-разработчик. Отвечай кратко, без воды и извинений. "
+    "Если просят код, выводи его в блоках markdown. "
+    "КРИТИЧЕСКИ ВАЖНО: ВСЕГДА указывай имя файла в заголовке блока кода, используя синтаксис: "
+    "```python filename=\"main.py\". "
+    "Если файлов несколько, используй отдельные блоки для каждого. "
+    "Никогда не пиши 'я не могу создать файл', просто выдай код."
+)
+
 class ModelCallback(CallbackData, prefix="model"):
     key: str
 
@@ -66,29 +66,47 @@ def model_keyboard(current_key: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for key, info in MODELS.items():
         text = f"✅ {info['name']}" if key == current_key else info["name"]
-        builder.button(
-            text=text,
-            callback_data=ModelCallback(key=key).pack(),
-        )
+        builder.button(text=text, callback_data=ModelCallback(key=key).pack())
     builder.adjust(1)
     return builder.as_markup()
 
-# --- ОБРАБОТЧИКИ КОМАНД ---
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ЧТЕНИЯ ССЫЛОК ---
+async def fetch_url_text(url: str) -> str:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as response:
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                # Удаляем скрипты и стили, оставляем только текст
+                for script in soup(["script", "style"]):
+                    script.extract()
+                text = soup.get_text(separator=' ', strip=True)
+                return text[:4000] # Ограничиваем размер текста
+    except Exception as e:
+        return f"[Не удалось прочитать ссылку: {e}]"
+
+# --- КОМАНДЫ ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет! Я бот-ассистент.\n"
-        "Просто напиши мне вопрос, и я отвечу.\n"
-        "Если попросишь код — я пришлю его файлом.\n\n"
-        "Сменить модель: /model"
+        "Привет! Я senior-разработчик.\n"
+        "Кидай мне ссылку на документацию или статью, или просто пиши задачу — я выдам код в файлах.\n\n"
+        "Команды:\n"
+        "/model — сменить модель\n"
+        "/clear — очистить историю диалога"
     )
+
+@router.message(Command("clear"))
+async def cmd_clear(message: Message):
+    user_id = message.from_user.id
+    user_histories[user_id].clear()
+    await message.answer("🧹 История диалога полностью очищена.")
 
 @router.message(Command("model"))
 async def cmd_model(message: Message):
-    user_id = message.from_user.id
-    current_key = get_model_key(user_id)
+    current_key = get_model_key(message.from_user.id)
     await message.answer(
-        f"Текущая модель: **{get_model_name(current_key)}**\n\nВыберите модель:",
+        f"Текущая модель: **{get_model_name(current_key)}**",
         reply_markup=model_keyboard(current_key),
         parse_mode="Markdown",
     )
@@ -97,87 +115,90 @@ async def cmd_model(message: Message):
 async def process_model_choice(callback: CallbackQuery, callback_data: ModelCallback):
     user_id = callback.from_user.id
     new_key = callback_data.key
-
-    if new_key not in MODELS:
-        await callback.answer("Неизвестная модель.", show_alert=True)
-        return
-
     user_models[user_id] = new_key
-    await callback.message.edit_text(
-        f"Модель изменена на **{get_model_name(new_key)}**.",
-        parse_mode="Markdown",
-        reply_markup=None,
-    )
-    await callback.answer(f"Выбрана модель: {get_model_name(new_key)}")
+    await callback.message.edit_text(f"Модель изменена на **{get_model_name(new_key)}**.", parse_mode="Markdown")
+    await callback.answer()
 
-# --- ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
+# --- ОСНОВНОЙ ОБРАБОТЧИК ---
 @router.message(F.text)
 async def handle_message(message: Message):
     user_id = message.from_user.id
     user_text = message.text
-    model_key = get_model_key(user_id)
-    model_id = MODELS[model_key]["id"]
+    model_id = MODELS[get_model_key(user_id)]["id"]
 
-    # Добавляем сообщение пользователя в историю
+    # 1. Проверяем, есть ли ссылка в сообщении
+    url_match = re.search(r'(https?://[^\s]+)', user_text)
+    if url_match:
+        url = url_match.group(1)
+        status_msg = await message.answer("🔗 Читаю ссылку, подожди...")
+        url_content = await fetch_url_text(url)
+        await status_msg.delete()
+        # Заменяем ссылку в тексте на её содержимое
+        user_text = user_text.replace(url, f"\n[Содержимое ссылки]:\n{url_content}\n")
+
+    # 2. Добавляем в историю
     user_histories[user_id].append({"role": "user", "content": user_text})
     if len(user_histories[user_id]) > MAX_HISTORY_LENGTH:
         user_histories[user_id] = user_histories[user_id][-MAX_HISTORY_LENGTH:]
 
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-
+    # 3. Показываем статус "Печатает..."
+    status_msg = await message.answer("⏳ Думаю над кодом...")
+    
     try:
-        # Системный промпт передается как первое сообщение в списке
-        messages_for_api = [
-            {"role": "system", "content": "Ты полезный ассистент. Отвечай на русском. Если пользователь просит написать код, ВСЕГДА оборачивай его в блоки markdown с указанием языка (например ```python)."}
-        ] + user_histories[user_id]
+        messages_for_api = [{"role": "system", "content": SYSTEM_PROMPT}] + user_histories[user_id]
 
         response = await client.chat.completions.create(
             model=model_id,
             messages=messages_for_api,
-            max_tokens=2048,
+            max_tokens=3000, # Увеличено для больших файлов
         )
         answer = response.choices[0].message.content
-        
-        # Сохраняем ответ в историю
         user_histories[user_id].append({"role": "assistant", "content": answer})
         
-        # --- ЛОГИКА ОТПРАВКИ ФАЙЛОВ ---
-        # Ищем блоки кода в ответе нейросети (между ```)
-        code_blocks = re.findall(r"```(\w*)\n(.*?)```", answer, re.DOTALL)
+        # Удаляем статус "Думаю..."
+        await status_msg.delete()
+        
+        # 4. Вытаскиваем файлы (ищем ```язык filename="имя" \n код ```)
+        # Регулярка ищет язык, имя файла и сам код
+        code_blocks = re.findall(r"```(\w+)?(?:\s+filename=[\"']?(.*?)[\"']?)?\n(.*?)```", answer, re.DOTALL)
         
         if code_blocks:
-            await message.answer("Вот ваш код, я упаковал его в файл 👇")
-            
-            for i, (lang, code) in enumerate(code_blocks):
-                # Определяем расширение (если язык не распознан, ставим .txt)
-                ext = EXTENSIONS.get(lang.lower(), "txt")
-                filename = f"code_{i+1}.{ext}" if len(code_blocks) > 1 else f"code.{ext}"
+            # Проверяем, есть ли осмысленный текст вокруг кода
+            clean_text = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
+            if clean_text:
+                await message.answer(clean_text)
                 
-                # Создаем виртуальный файл в памяти
+            for lang, filename, code in code_blocks:
+                lang = lang or "txt"
+                # Если нейросеть забыла имя файла, делаем fallback
+                if not filename or filename.strip() == "":
+                    filename = f"snippet.{lang}"
+                else:
+                    # Чистим имя от кавычек, если ИИ накосячил
+                    filename = filename.replace('"', '').replace("'", "").strip()
+
+                # Отправляем файл
                 file_bytes = code.strip().encode('utf-8')
                 file_to_send = BufferedInputFile(file=file_bytes, filename=filename)
-                
-                # Отправляем файл в чат
                 await message.answer_document(document=file_to_send)
-                
-            # Если код был отправлен файлом, дополнительно дублируем текст, если он короткий
-            if len(code_blocks[0][1]) < 500:
-                await message.answer(f"```\n{code_blocks[0][1]}\n```", parse_mode="Markdown")
         else:
-            # Если кода нет, просто отвечаем текстом
+            # Если это просто текстовый ответ (без кода)
             await message.answer(answer)
             
     except Exception as e:
-        logging.exception("Ошибка при запросе к API")
-        await message.answer(f"Произошла ошибка: {e}")
+        await status_msg.delete()
+        logging.exception("Ошибка API")
+        if "503" in str(e):
+            await message.answer("⚠️ **Сервера провайдера перегружены (503).** Подожди пару минут или смени модель через /model.")
+        else:
+            await message.answer(f"Ошибка: {e}")
 
-# --- ЗАПУСК БОТА ---
 async def main():
     logging.basicConfig(level=logging.INFO)
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    print("Бот запущен и готов к работе!")
+    print("Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
