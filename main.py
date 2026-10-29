@@ -44,10 +44,9 @@ BASE_SYSTEM_PROMPT = (
     "Пиши на русском."
 )
 
-# --- БАЗА ДАННЫХ (ПАМЯТЬ И ПРАВИЛА) ---
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
-        # Таблица истории
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,7 +56,6 @@ async def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Таблица правил (обучения)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,18 +67,12 @@ async def init_db():
 
 async def add_to_history(user_id: int, role: str, content: str):
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)",
-            (user_id, role, content)
-        )
+        await db.execute("INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)", (user_id, role, content))
         await db.commit()
 
 async def get_history(user_id: int, limit: int = 20):
     async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute(
-            "SELECT role, content FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-            (user_id, limit)
-        )
+        cursor = await db.execute("SELECT role, content FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
         rows = await cursor.fetchall()
         return [{"role": row[0], "content": row[1]} for row in reversed(rows)]
 
@@ -89,7 +81,7 @@ async def clear_history(user_id: int):
         await db.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
         await db.commit()
 
-# --- УПРАВЛЕНИЕ ПРАВИЛАМИ (САМООБУЧЕНИЕ) ---
+# --- ПРАВИЛА (САМООБУЧЕНИЕ) ---
 async def add_rule(user_id: int, rule_text: str):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("INSERT INTO rules (user_id, rule_text) VALUES (?, ?)", (user_id, rule_text))
@@ -99,8 +91,7 @@ async def get_rules(user_id: int) -> str:
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT rule_text FROM rules WHERE user_id = ?", (user_id,))
         rows = await cursor.fetchall()
-        if not rows:
-            return ""
+        if not rows: return ""
         rules = "\n".join([f"- {row[0]}" for row in rows])
         return f"\n\nВАЖНЫЕ ПРАВИЛА ОТ ПОЛЬЗОВАТЕЛЯ (ОБЯЗАТЕЛЬНЫ К ИСПОЛНЕНИЮ):\n{rules}"
 
@@ -114,33 +105,24 @@ async def list_rules(user_id: int) -> list:
         cursor = await db.execute("SELECT id, rule_text FROM rules WHERE user_id = ?", (user_id,))
         return await cursor.fetchall()
 
-# --- ЧТЕНИЕ ССЫЛОК ---
+# --- ПАРСИНГ ССЫЛОК (ЧЕРЕЗ JINA AI) ---
 async def fetch_url_text(url: str) -> str:
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        if "t.me/" in url and "/s/" not in url:
-            url = url.replace("t.me/", "t.me/s/")
-
+        # Jina AI превращает любую страницу в чистый текст (Markdown)
+        jina_url = f"https://r.jina.ai/{url}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=15) as response:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                if "t.me" in url:
-                    messages = soup.find_all("div", class_="tgme_widget_message_text")
-                    if messages:
-                        full_text = "\n".join([msg.get_text(separator='\n', strip=True) for msg in messages])
-                        if len(full_text) > 20:
-                            return full_text
-                    return "[Ошибка: Telegram заблокировал чтение. Пришли текст файлом или сообщением]"
-                
-                for script in soup(["script", "style", "noscript"]): script.extract()
-                text = ' '.join(soup.get_text(separator=' ').split())
-                return text[:8000]
+            async with session.get(jina_url, headers=headers, timeout=25) as response:
+                if response.status == 200:
+                    text = await response.text()
+                    return text[:10000] # Ограничиваем 10к символов
+                else:
+                    return f"[Ошибка чтения сайта. Код: {response.status}. Скинь текст файлом]"
     except Exception as e:
         return f"[Не удалось прочитать ссылку: {e}]"
 
-# --- ОТПРАВКА КОДА ФАЙЛАМИ ---
+# --- ОТПРАВКА КОДА ---
 def split_long_text(text: str, max_length: int = 4000) -> list:
     parts = []
     while len(text) > max_length:
@@ -180,7 +162,6 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
     except: pass
 
     try:
-        # Берем базовый промпт и ДОБАВЛЯЕМ правила, которым он научился
         user_rules = await get_rules(user_id)
         final_system_prompt = BASE_SYSTEM_PROMPT + user_rules
         
@@ -216,19 +197,19 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! Я твой ИИ-разработчик.\n\n"
-        "🧠 **Я умею учиться на своих ошибках.**\n"
-        "Если я тупанул, напиши команду `/rule [как надо было сделать]`.\n"
-        "Например: `/rule Если я присылаю ссылку на ТГ, не говори что не видишь текст, а ищи класс tgme_widget_message_text`.\n\n"
+        "🧠 **Я умею учиться на ошибках.**\n"
+        "Если я тупанул, напиши `/rule [как надо было сделать]`.\n"
+        "Например: `/rule Всегда пиши код с комментариями`.\n\n"
         "Команды:\n"
-        "/rules — посмотреть мои правила\n"
-        "/clear — очистить память диалога\n"
-        "/forget_rules — удалить все правила"
+        "/rules — мои правила\n"
+        "/clear — очистить память\n"
+        "/forget_rules — забыть правила"
     )
 
 @router.message(Command("clear"))
 async def cmd_clear(message: Message):
     await clear_history(message.from_user.id)
-    await message.answer("🧹 История диалога очищена. Но я всё ещё помню твои правила (/rules).")
+    await message.answer("🧹 История диалога очищена.")
 
 @router.message(Command("rule"))
 async def cmd_add_rule(message: Message):
@@ -237,16 +218,15 @@ async def cmd_add_rule(message: Message):
         await message.answer("Напиши правило после команды. Пример: `/rule Всегда пиши код с комментариями`")
         return
     await add_rule(message.from_user.id, rule_text)
-    await message.answer(f"🧠 Запомнил новое правило:\n_{rule_text}_\n\nТеперь я буду это учитывать.", parse_mode="Markdown")
+    await message.answer(f"🧠 Запомнил новое правило:\n_{rule_text}_", parse_mode="Markdown")
 
 @router.message(Command("rules"))
 async def cmd_list_rules(message: Message):
     rules = await list_rules(message.from_user.id)
     if not rules:
-        await message.answer("У меня пока нет правил. Напиши `/rule [текст]`, чтобы обучить меня.")
+        await message.answer("У меня нет правил. Напиши `/rule [текст]`, чтобы обучить меня.")
         return
-    
-    text = "📋 **Твои правила (чему я научился):**\n\n"
+    text = "📋 **Твои правила:**\n\n"
     for r_id, r_text in rules:
         text += f"{r_id}. {r_text}\n"
     await message.answer(text, parse_mode="Markdown")
@@ -286,7 +266,7 @@ async def handle_photo(message: Message):
         await status_msg.delete()
         await message.answer(f"Ошибка при чтении фото: {e}")
 
-# --- ФАЙЛЫ (PDF, TXT, КОД) ---
+# --- ФАЙЛЫ ---
 @router.message(F.document)
 async def handle_document(message: Message):
     user_id = message.from_user.id
@@ -344,7 +324,7 @@ async def handle_text(message: Message):
     url_match = re.search(r'(https?://[^\s]+)', user_text)
     if url_match:
         url = url_match.group(1)
-        status_msg = await message.answer("⏳ Читаю сайт/пост...")
+        status_msg = await message.answer("⏳ Читаю сайт (через Jina AI)...")
         content = await fetch_url_text(url)
         user_text = user_text.replace(url, f"\n[Текст по ссылке]:\n{content}\n")
     else:
