@@ -33,20 +33,20 @@ DB_FILE = "bot_memory.db"
 if not BOT_TOKEN or not XEROSHARC_API_KEY or not BACKUP_CHAT_ID:
     raise ValueError("Не заданы BOT_TOKEN, XEROSHARC_API_KEY или BACKUP_CHAT_ID!")
 
-# Используем самую мощную модель с твоего нового тарифа
-MODEL_ID = "claude-opus-5-5" 
+# Используем Sonnet 5.5 — она быстрая, умная и не виснет
+MODEL_ID = "claude-sonnet-5-5" 
 
 router = Router()
 client = AsyncOpenAI(
     api_key=XEROSHARC_API_KEY, 
     base_url=XEROSHARC_BASE_URL,
-    timeout=180.0 
+    timeout=120.0,
+    max_retries=0  # Отключаем автоматический быстрый повтор
 )
 
 class BotStates(StatesGroup):
     waiting_for_rule = State()
 
-# --- СИСТЕМНЫЙ ПРОМПТ ---
 BASE_SYSTEM_PROMPT = (
     "Ты — профессиональный программист и ИИ-ассистент. "
     "ВНИМАНИЕ: Твой бэкенд (бот) уже скачал текст по ссылке и передал его тебе. "
@@ -85,7 +85,7 @@ async def add_to_history(user_id: int, role: str, content: str):
         await db.execute("INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)", (user_id, role, content))
         await db.commit()
 
-async def get_history(user_id: int, limit: int = 50):
+async def get_history(user_id: int, limit: int = 15): # Ограничили память, чтобы сервер не вис
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT role, content FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
         rows = await cursor.fetchall()
@@ -143,7 +143,7 @@ async def fetch_url_text(url: str) -> str:
         async with aiohttp.ClientSession() as session:
             async with session.get(jina_url, timeout=60) as response:
                 if response.status == 200:
-                    return (await response.text())[:80000] # Читаем до 80к символов
+                    return (await response.text())[:40000]
                 return "[Ошибка чтения сайта]"
     except Exception as e:
         return f"[Ошибка: {e}]"
@@ -178,13 +178,11 @@ async def send_code_files(message: Message, answer: str):
             lang = lang or "txt"
             code_stripped = code.strip()
             
-            # Если есть имя файла или код длинный - шлем файлом
             if custom_filename or len(code_stripped) > 150:
                 filename = custom_filename.replace('"', '').replace("'", "").strip() if custom_filename else f"snippet.{lang}"
                 doc = BufferedInputFile(file=code_stripped.encode('utf-8'), filename=filename)
                 await message.answer_document(document=doc)
             else:
-                # Короткие примеры шлем текстом
                 await safe_answer(message, f"```{lang}\n{code_stripped}\n```")
     elif not clean_text:
         for chunk in split_long_text(answer):
@@ -197,14 +195,31 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
 
     try:
         user_rules = await get_rules(user_id)
-        history = await get_history(user_id, limit=50)
+        history = await get_history(user_id, limit=15)
         messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT + user_rules}] + history
         
-        response = await client.chat.completions.create(
-            model=MODEL_ID, 
-            messages=messages, 
-            max_tokens=8000
-        )
+        max_retries = 3
+        response = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = await client.chat.completions.create(
+                    model=MODEL_ID, 
+                    messages=messages, 
+                    max_tokens=4000 
+                )
+                break 
+            except Exception as e:
+                if "429" in str(e) and attempt < max_retries - 1:
+                    if status_msg:
+                        try: await status_msg.edit_text(f"⏳ Сервер перегружен. Жду 20 секунд...")
+                        except: pass
+                    await asyncio.sleep(20) 
+                else:
+                    raise e 
+
+        if not response:
+            raise Exception("Не удалось получить ответ")
 
         answer = response.choices[0].message.content
         await add_to_history(user_id, "assistant", answer)
@@ -223,11 +238,9 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
         
         error_str = str(e)
         if "429" in error_str:
-            await message.answer("⚠️ Сервер говорит, что запросы идут слишком быстро. Подожди 10 секунд.")
+            await message.answer("⚠️ **Сервер заблокировал запросы.**\nПодожди 1 минуту и напиши снова.")
         elif "403" in error_str:
-            await message.answer("⚠️ **Токены закончились!** Проверь баланс на сайте.")
-        elif "503" in error_str or "502" in error_str:
-            await message.answer("⚠️ Сервера провайдера перегружены. Подожди минуту.")
+            await message.answer("⚠️ **Токены закончились!**")
         else:
             await message.answer(f"Произошла ошибка: {e}")
 
@@ -235,9 +248,9 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Я твой ИИ-разработчик на базе Claude Opus 5.5.\n\n"
-        "💾 У меня включен авто-бэкап памяти.\n"
-        "Скидывай мне ТЗ, ссылки, фото или файлы — я всё прочитаю и выполню.",
+        "👋 Привет! Я твой ИИ-разработчик.\n\n"
+        "Скидывай мне ТЗ, ссылки, фото или файлы — я всё прочитаю и выполню.\n"
+        "Пользуйся кнопками внизу.",
         reply_markup=get_main_menu()
     )
 
@@ -253,7 +266,7 @@ async def btn_clear(message: Message):
 
 @router.message(F.text == "❓ Помощь")
 async def btn_help(message: Message):
-    await message.answer("Просто пиши задачи! Я пишу код, читаю ссылки (через Jina AI) и помню контекст.", reply_markup=get_main_menu())
+    await message.answer("Просто пиши задачи! Я пишу код, читаю ссылки и помню контекст.", reply_markup=get_main_menu())
 
 @router.message(F.text == "🧠 Мои правила")
 async def btn_rules(message: Message):
@@ -290,11 +303,11 @@ async def handle_photo(message: Message):
         caption = message.caption or "Разбери этот скриншот."
         await add_to_history(message.from_user.id, "user", f"[Фото]: {caption}")
         
-        history = await get_history(message.from_user.id, limit=20)
+        history = await get_history(message.from_user.id, limit=10)
         content = [{"type": "text", "text": caption}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
         messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}] + history + [{"role": "user", "content": content}]
         
-        response = await client.chat.completions.create(model=MODEL_ID, messages=messages, max_tokens=8000)
+        response = await client.chat.completions.create(model=MODEL_ID, messages=messages, max_tokens=4000)
         answer = response.choices[0].message.content
         await add_to_history(message.from_user.id, "assistant", answer)
         await status_msg.delete()
@@ -317,12 +330,12 @@ async def handle_document(message: Message):
         
         if message.document.file_name.lower().endswith('.pdf'):
             reader = PdfReader(io.BytesIO(raw_data))
-            for page in reader.pages[:50]: 
+            for page in reader.pages[:30]: 
                 extracted_text += (page.extract_text() or "") + "\n"
         else:
             extracted_text = raw_data.decode('utf-8')
 
-        prompt = f"Файл `{message.document.file_name}`:\n\n```\n{extracted_text[:80000]}\n```\n\n{message.caption or 'Проанализируй.'}"
+        prompt = f"Файл `{message.document.file_name}`:\n\n```\n{extracted_text[:40000]}\n```\n\n{message.caption or 'Проанализируй.'}"
         await add_to_history(message.from_user.id, "user", prompt)
         await process_ai_response(message, message.from_user.id, status_msg)
     except Exception as e:
@@ -339,8 +352,7 @@ async def handle_text(message: Message):
         url = url_match.group(1)
         status_msg = await message.answer("⏳ Выкачиваю текст по ссылке...")
         content = await fetch_url_text(url)
-        # Скрытый контекст: нейросеть видит текст, но промпт запрещает ей его пересказывать
-        user_text = f"[СИСТЕМНОЕ СООБЩЕНИЕ: Бот скачал текст по ссылке {url}. Вот он: {content}]\n\n" + user_text.replace(url, "")
+        user_text = f"[СИСТЕМНОЕ СООБЩЕНИЕ: Текст по ссылке {url}:\n{content}]\n\n" + user_text.replace(url, "")
     else:
         status_msg = await message.answer("⏳ Читаю и думаю...")
 
@@ -357,7 +369,7 @@ async def main():
     
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    print("Бот запущен на Claude Opus 5.5!")
+    print("Бот запущен на Sonnet 5.5!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
