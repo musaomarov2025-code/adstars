@@ -20,16 +20,15 @@ XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1"
 if not BOT_TOKEN or not XEROSHARC_API_KEY:
     raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY")
 
-# Реестр моделей: ключ для кнопки -> ID модели для API
-# ВАЖНО: Названия моделей могут отличаться! Уточните их в личном кабинете xerosharc.site.
+# ОБНОВЛЕННЫЙ СПИСОК МОДЕЛЕЙ (взято с вашего скриншота)
 MODELS = {
-    "claude-sonnet": {"id": "claude-3-5-sonnet-20241022", "name": "Claude 3.5 Sonnet"},
-    "claude-haiku": {"id": "claude-3-haiku-20240307", "name": "Claude 3 Haiku"},
-    "gpt-4o": {"id": "gpt-4o", "name": "GPT-4o"},
-    "gpt-4o-mini": {"id": "gpt-4o-mini", "name": "GPT-4o Mini"},
+    "claude-haiku": {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5 (Быстрая)"},
+    "claude-sonnet": {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Средняя)"},
+    "claude-opus": {"id": "claude-opus-5-5", "name": "Claude Opus 5.5 (Умная)"},
+    "gpt-6": {"id": "gpt-6.1-sol", "name": "GPT-6.1 Sol"},
 }
 
-DEFAULT_MODEL_KEY = "claude-sonnet"
+DEFAULT_MODEL_KEY = "claude-sonnet" # Модель по умолчанию
 
 user_histories = defaultdict(list)
 user_models = {}
