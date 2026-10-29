@@ -38,14 +38,13 @@ client = AsyncOpenAI(
 SYSTEM_PROMPT = (
     "Ты — элитный senior-разработчик и эксперт по IT. Ты пишешь код на Python, JS/TS, Java, Kotlin, Swift, C#, C++, Go, Rust, PHP, SQL, Bash, HTML/CSS. "
     "Твои задачи: писать код с нуля, исправлять ошибки, объяснять код, писать тесты, переводить код с языка на язык. "
-    "Ты помогаешь с Telegram-ботами (aiogram, telebot), парсерами, API, сайтами, базами данных и pandas. "
-    "ВАЖНО: Ты не можешь запускать код в реальном времени, но можешь давать готовые решения. "
+    "Ты помогаешь с Telegram-ботами, парсерами, API, сайтами, базами данных и pandas. "
     "ФОРМАТИРОВАНИЕ: ВСЕГДА оборачивай код в Markdown-блоки с указанием имени файла. Пример: ```python filename=\"main.py\"\nprint('hi')\n```. "
     "Если файлов несколько, используй отдельный блок для каждого. Никогда не пиши 'я не могу создать файл'. "
     "Отвечай без воды, кратко и по делу. Пиши на русском."
 )
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ (ПАМЯТЬ) ---
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -67,14 +66,13 @@ async def add_to_history(user_id: int, role: str, content: str):
         )
         await db.commit()
 
-async def get_history(user_id: int, limit: int = 20):
+async def get_history(user_id: int, limit: int = 40):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute(
             "SELECT role, content FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
             (user_id, limit)
         )
         rows = await cursor.fetchall()
-        # Разворачиваем данных, так как достали с конца
         history = [{"role": row[0], "content": row[1]} for row in reversed(rows)]
         return history
 
@@ -86,16 +84,13 @@ async def clear_history(user_id: int):
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async def fetch_url_text(url: str) -> str:
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=15) as response:
                 soup = BeautifulSoup(await response.text(), 'html.parser')
                 for script in soup(["script", "style", "noscript"]): script.extract()
-                # Берем текст, убираем лишние пробелы
                 text = ' '.join(soup.get_text(separator=' ').split())
-                return text[:8000] # Увеличили лимит текста до 8000 символов
+                return text[:8000]
     except Exception as e:
         return f"[Не удалось прочитать ссылку: {e}]"
 
@@ -103,8 +98,7 @@ def split_long_text(text: str, max_length: int = 4000) -> list:
     parts = []
     while len(text) > max_length:
         split_idx = text.rfind('\n', 0, max_length)
-        if split_idx == -1:
-            split_idx = max_length
+        if split_idx == -1: split_idx = max_length
         parts.append(text[:split_idx])
         text = text[split_idx:].lstrip()
     parts.append(text)
@@ -113,7 +107,6 @@ def split_long_text(text: str, max_length: int = 4000) -> list:
 async def send_code_files(message: Message, answer: str):
     pattern = r"```(?:(\w+)\s+filename=[\"'](.*?)[\"']|(\w+))\n(.*?)```"
     matches = re.findall(pattern, answer, re.DOTALL)
-    
     clean_text = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
     
     if clean_text:
@@ -126,7 +119,6 @@ async def send_code_files(message: Message, answer: str):
             lang = lang or default_lang or "txt"
             filename = custom_filename or f"snippet.{lang}"
             filename = filename.replace('"', '').replace("'", "").strip()
-
             file_bytes = code.strip().encode('utf-8')
             doc = BufferedInputFile(file=file_bytes, filename=filename)
             await message.answer_document(document=doc)
@@ -137,12 +129,10 @@ async def send_code_files(message: Message, answer: str):
 async def process_ai_response(message: Message, user_id: int, status_msg: Message = None):
     try:
         await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    except:
-        pass
+    except: pass
 
     try:
-        # Берем историю из базы!
-        history = await get_history(user_id, limit=20)
+        history = await get_history(user_id, limit=40)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
         
         response = await client.chat.completions.create(
@@ -151,27 +141,21 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
             max_tokens=4000,
         )
         answer = response.choices[0].message.content
-        
-        # Сохраняем ответ ИИ в базу
         await add_to_history(user_id, "assistant", answer)
         
         if status_msg:
-            try:
-                await status_msg.delete()
-            except:
-                pass
+            try: await status_msg.delete()
+            except: pass
                 
         await send_code_files(message, answer)
 
     except Exception as e:
         if status_msg:
-            try:
-                await status_msg.delete()
-            except:
-                pass
+            try: await status_msg.delete()
+            except: pass
         logging.exception("Ошибка API")
         if "503" in str(e) or "502" in str(e):
-            await message.answer("⚠️ Сервера провайдера перегружены. Подожди минуту и попробуй снова.")
+            await message.answer("⚠️ Сервера провайдера перегружены. Подожди минуту.")
         else:
             await message.answer(f"Произошла ошибка: {e}")
 
@@ -179,8 +163,9 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Я твой ИИ-разработчик с постоянной памятью.\n\n"
-        "Я больше не забываю контекст при перезапуске. Можешь скидывать текст, ссылки, фото и файлы."
+        "👋 Привет! Я твой ИИ-разработчик.\n\n"
+        "⚠️ Если у тебя очень длинный текст (больше 1-2 экранов), "
+        "сохрани его в файл `.txt` и отправь мне. Я прочитаю всё целиком!"
     )
 
 @router.message(Command("clear"))
@@ -199,31 +184,21 @@ async def handle_photo(message: Message):
         file_bytes = await message.bot.download_file(file_info.file_path)
         base64_image = base64.b64encode(file_bytes.read()).decode('utf-8')
         
-        caption = message.caption or "Разбери этот скриншот (код, ошибка, схема)."
+        caption = message.caption or "Разбери этот скриншот."
+        await add_to_history(user_id, "user", f"[Фото]: {caption}")
         
-        content = [
-            {"type": "text", "text": caption},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-        ]
-        
-        # В базу пишем текстовое описание (чтобы не ломать БД base64)
-        await add_to_history(user_id, "user", f"[Пользователь прислал фото]: {caption}")
-        
-        # Отправляем запрос в API с картинкой
-        try:
-            await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        try: await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
         except: pass
         
-        history = await get_history(user_id, limit=10)
+        history = await get_history(user_id, limit=20)
+        content = [{"type": "text", "text": caption}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": content}]
         
         response = await client.chat.completions.create(model=MODEL_ID, messages=messages, max_tokens=4000)
         answer = response.choices[0].message.content
-        
         await add_to_history(user_id, "assistant", answer)
         await status_msg.delete()
         await send_code_files(message, answer)
-        
     except Exception as e:
         await status_msg.delete()
         await message.answer(f"Ошибка при чтении фото: {e}")
@@ -267,7 +242,7 @@ async def handle_document(message: Message):
             await message.answer("Файл пустой.")
             return
 
-        caption = message.caption or 'Проанализируй/исправь.'
+        caption = message.caption or 'Проанализируй этот файл/код.'
         prompt = f"Файл `{document.file_name}`:\n\n```\n{extracted_text[:20000]}\n```\n\n{caption}"
         
         await add_to_history(user_id, "user", prompt)
@@ -281,9 +256,15 @@ async def handle_document(message: Message):
 @router.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
-    # Используем html_text, чтобы жирный шрифт конвертировался в нормальный текст
-    user_text = message.text 
     
+    # Берем текст с форматированием (чтобы жирный шрифт и списки не ломались)
+    user_text = message.html_text if message.html_text else message.text
+    
+    # Если текст СЛИШКОМ длинный - предупреждаем
+    if len(user_text) > 5000:
+        await message.answer("⚠️ Твой текст слишком длинный для одного сообщения (сервер может его обрезать).\nПожалуйста, сохрани его в файл `.txt` и отправь мне документом.")
+        return
+
     url_match = re.search(r'(https?://[^\s]+)', user_text)
     if url_match:
         url = url_match.group(1)
@@ -293,17 +274,16 @@ async def handle_text(message: Message):
     else:
         status_msg = await message.answer("⏳ Думаю...")
 
-    # Сохраняем в базу входящее сообщение
     await add_to_history(user_id, "user", user_text)
     await process_ai_response(message, user_id, status_msg)
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    await init_db() # Инициализируем БД при старте
+    await init_db()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    print("Бот-разработчик с базой данных запущен!")
+    print("Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
