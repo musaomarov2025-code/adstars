@@ -3,3 +3,4 @@ openai>=1.0,<2
 python-dotenv
 aiohttp
 beautifulsoup4
+pypdf
