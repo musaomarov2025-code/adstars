@@ -11,7 +11,13 @@ from pypdf import PdfReader
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import (
+    Message, BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton, 
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -32,34 +38,49 @@ router = Router()
 client = AsyncOpenAI(
     api_key=XEROSHARC_API_KEY, 
     base_url=XEROSHARC_BASE_URL,
-    timeout=180.0 # Ждем ответа до 3 минут (для огромных текстов)
+    timeout=180.0 
 )
 
-# ЖЕСТКИЙ ПРОМПТ: Указываем нейросети, что использовать ТОЛЬКО Markdown
+# --- СОСТОЯНИЯ (ДЛЯ ДОБАВЛЕНИЯ ПРАВИЛ) ---
+class BotStates(StatesGroup):
+    waiting_for_rule = State()
+
+# --- ЖЕСТКИЙ ПРОМПТ ---
 BASE_SYSTEM_PROMPT = (
     "Ты — профессиональный программист и ИИ-ассистент. "
     "ВНИМАНИЕ: Твой бэкенд (бот) уже скачал текст по ссылке и передал его тебе. "
-    "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать 'я не могу читать ссылки', 'я вижу только половину' или давать инструкции по API. "
-    "Если в сообщении есть текст, извлеченный по ссылке, просто прочитай его и ответь по сути. "
-    "ФОРМАТИРОВАНИЕ: Отвечай с использованием Markdown. Для жирного текста используй **текст**, для курсива *текст*. "
-    "ВСЕГДА оборачивай код в блоки с указанием имени файла. Пример: ```python filename=\"main.py\"\nprint('hi')\n```. "
-    "Если файлов несколько, используй отдельный блок для каждого. Пиши на русском, без воды."
+    "ГЛАВНОЕ ПРАВИЛО: Если пользователь прислал текст или ссылку, КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО выводить этот текст обратно или пересказывать его. "
+    "Ты должен ответить ОДНОЙ короткой фразой, например: 'Я прочитал этот материал. Что нужно с ним сделать?' или 'Изучил ТЗ. Приступаем к написанию кода?'. "
+    "Если пользователь просит нарисовать фото, ответь: 'Я текстовая модель и не умею генерировать изображения'. "
+    "ФОРМАТИРОВАНИЕ: Отвечай с использованием Markdown. Для жирного текста используй **текст**. "
+    "КРИТИЧЕСКИ ВАЖНО: Если ты пишешь код целого файла, ВСЕГДА указывай его имя и язык в начале блока. "
+    "Пример: ```python filename=\"main.py\"\nprint('hi')\n```. "
+    "Если это просто короткий пример (1-5 строк), пиши без имени файла. "
+    "Пиши на русском, кратко и по делу."
 )
 
-# --- БЕЗОПАСНАЯ ОТПРАВКА СООБЩЕНИЙ (ЧТОБЫ НЕ БЫЛО ЗВЕЗДОЧЕК) ---
-async def safe_answer(message: Message, text: str):
-    if not text.strip(): return
-    try:
-        # Пытаемся отправить красиво с Markdown (жирный шрифт, курсив)
-        await message.answer(text, parse_mode="Markdown")
-    except Exception:
-        try:
-            # Если Telegram ругается на кривую разметку от ИИ, отправляем чистый текст
-            await message.answer(text)
-        except Exception as e:
-            logging.error(f"Не удалось отправить сообщение: {e}")
+# --- КЛАВИАТУРЫ ---
+def get_main_menu() -> ReplyKeyboardMarkup:
+    """Главное меню внизу экрана"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🧠 Мои правила"), KeyboardButton(text="🧹 Очистить память")],
+            [KeyboardButton(text="❓ Помощь")]
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Отправь текст, файл или ссылку..."
+    )
+    return keyboard
 
-# --- БАЗА ДАННЫХ (ПАМЯТЬ И ПРАВИЛА) ---
+def get_rules_menu() -> InlineKeyboardMarkup:
+    """Кнопки под списком правил"""
+    builder = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить правило", callback_data="add_rule")],
+        [InlineKeyboardButton(text="🗑 Удалить все правила", callback_data="clear_rules")]
+    ])
+    return builder
+
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -85,7 +106,7 @@ async def add_to_history(user_id: int, role: str, content: str):
         await db.execute("INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)", (user_id, role, content))
         await db.commit()
 
-async def get_history(user_id: int, limit: int = 50): # Память увеличена до 50 сообщений
+async def get_history(user_id: int, limit: int = 50):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT role, content FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))
         rows = await cursor.fetchall()
@@ -116,29 +137,29 @@ async def clear_rules(user_id: int):
 
 async def list_rules(user_id: int) -> list:
     async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute("SELECT id, rule_text FROM rules WHERE user_id = ?", (user_id,))
+        cursor = await db.execute("SELECT rule_text FROM rules WHERE user_id = ?", (user_id,))
         return await cursor.fetchall()
 
-# --- ПАРСИНГ ССЫЛОК (JINA AI) ---
+# --- ПАРСИНГ И ОТПРАВКА ---
 async def fetch_url_text(url: str) -> str:
     try:
         jina_url = f"https://r.jina.ai/{url}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        
         async with aiohttp.ClientSession() as session:
-            async with session.get(jina_url, headers=headers, timeout=60) as response:
+            async with session.get(jina_url, timeout=60) as response:
                 if response.status == 200:
                     text = await response.text()
-                    # Ограничение поднято до 80 000 символов (огромные статьи/ТЗ)
-                    if len(text) > 80000:
-                        return text[:80000] + "\n\n[...Текст обрезан, так как он слишком длинный...]"
-                    return text
-                else:
-                    return f"[Ошибка: сайт заблокировал чтение. Скинь текст файлом]"
+                    return text[:80000]
+                return "[Ошибка чтения]"
     except Exception as e:
-        return f"[Ошибка чтения ссылки: {e}]"
+        return f"[Ошибка: {e}]"
 
-# --- ОТПРАВКА КОДА ---
+async def safe_answer(message: Message, text: str):
+    if not text.strip(): return
+    try:
+        await message.answer(text, parse_mode="Markdown")
+    except Exception:
+        await message.answer(text)
+
 def split_long_text(text: str, max_length: int = 4000) -> list:
     parts = []
     while len(text) > max_length:
@@ -150,31 +171,36 @@ def split_long_text(text: str, max_length: int = 4000) -> list:
     return parts
 
 async def send_code_files(message: Message, answer: str):
-    pattern = r"```(?:(\w+)\s+filename=[\"'](.*?)[\"']|(\w+))\n(.*?)```"
+    pattern = r"```(?:(\w+)?\s*(?:filename=[\"'](.*?)[\"'])?)\n(.*?)```"
     matches = re.findall(pattern, answer, re.DOTALL)
     clean_text = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
     
     if clean_text:
         for chunk in split_long_text(clean_text):
-            await safe_answer(message, chunk) # Используем безопасную отправку
+            await safe_answer(message, chunk)
 
     if matches:
         for m in matches:
-            lang, custom_filename, default_lang, code = m
-            lang = lang or default_lang or "txt"
-            filename = custom_filename or f"snippet.{lang}"
-            filename = filename.replace('"', '').replace("'", "").strip()
-            file_bytes = code.strip().encode('utf-8')
-            doc = BufferedInputFile(file=file_bytes, filename=filename)
-            await message.answer_document(document=doc)
+            lang, custom_filename, code = m
+            lang = lang or "txt"
+            code_stripped = code.strip()
+
+            # Если имя файла указано ИЛИ код длинный (>150 символов) — шлем файлом
+            if custom_filename or len(code_stripped) > 150:
+                filename = custom_filename.replace('"', '').replace("'", "").strip() if custom_filename else f"snippet.{lang}"
+                file_bytes = code_stripped.encode('utf-8')
+                doc = BufferedInputFile(file=file_bytes, filename=filename)
+                await message.answer_document(document=doc)
+            else:
+                # Короткий код шлем текстом
+                await safe_answer(message, f"```{lang}\n{code_stripped}\n```")
     elif not clean_text:
         for chunk in split_long_text(answer):
             await safe_answer(message, chunk)
 
 # --- ЗАПРОС К НЕЙРОСЕТИ ---
 async def process_ai_response(message: Message, user_id: int, status_msg: Message = None):
-    try:
-        await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try: await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     except: pass
 
     try:
@@ -187,7 +213,7 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
         response = await client.chat.completions.create(
             model=MODEL_ID,
             messages=messages,
-            max_tokens=8000, # Увеличено для написания длинных кодов
+            max_tokens=8000,
         )
         answer = response.choices[0].message.content
         await add_to_history(user_id, "assistant", answer)
@@ -204,50 +230,66 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
             except: pass
         logging.exception("Ошибка API")
         if "503" in str(e) or "502" in str(e):
-            await message.answer("⚠️ Сервера провайдера перегружены. Подожди минуту.")
+            await message.answer("⚠️ Сервера перегружены. Подожди минуту.")
         else:
             await message.answer(f"Произошла ошибка: {e}")
 
-# --- КОМАНДЫ ---
+# --- КОМАНДЫ И КНОПКИ ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! Я твой ИИ-разработчик.\n\n"
-        "Теперь я пишу красивым шрифтом, читаю огромные ссылки (до 80к символов) и помню 50 последних сообщений.\n\n"
-        "Команды:\n"
-        "/rules — мои правила\n"
-        "/clear — очистить память"
+        "Пользуйся кнопками внизу экрана. Скидывай мне ТЗ, ссылки, фото или файлы — я всё прочитаю и выполню.",
+        reply_markup=get_main_menu()
     )
 
-@router.message(Command("clear"))
-async def cmd_clear(message: Message):
+@router.message(F.text == "🧹 Очистить память")
+async def btn_clear(message: Message):
     await clear_history(message.from_user.id)
-    await message.answer("🧹 История диалога очищена.")
+    await message.answer("🧹 Память диалога очищена.", reply_markup=get_main_menu())
 
-@router.message(Command("rule"))
-async def cmd_add_rule(message: Message):
-    rule_text = message.text.replace("/rule", "").strip()
-    if not rule_text:
-        await message.answer("Напиши правило после команды. Пример: `/rule Всегда пиши код с комментариями`")
-        return
-    await add_rule(message.from_user.id, rule_text)
-    await message.answer(f"🧠 Запомнил новое правило:\n_{rule_text}_", parse_mode="Markdown")
+@router.message(F.text == "❓ Помощь")
+async def btn_help(message: Message):
+    await message.answer(
+        "Я умею:\n"
+        "• Писать код и отправлять его файлами.\n"
+        "• Читать ссылки (через Jina AI).\n"
+        "• Читать PDF и фото.\n"
+        "• Учиться на твоих правилах.\n\n"
+        "Просто пиши мне задачу!",
+        reply_markup=get_main_menu()
+    )
 
-@router.message(Command("rules"))
-async def cmd_list_rules(message: Message):
+@router.message(F.text == "🧠 Мои правила")
+async def btn_rules(message: Message):
     rules = await list_rules(message.from_user.id)
+    text = "📋 **Твои правила (чему я научился):**\n\n"
     if not rules:
-        await message.answer("У меня нет правил. Напиши `/rule [текст]`, чтобы обучить меня.")
-        return
-    text = "📋 **Твои правила:**\n\n"
-    for r_id, r_text in rules:
-        text += f"{r_id}. {r_text}\n"
-    await message.answer(text, parse_mode="Markdown")
+        text = "У меня пока нет правил. Нажми «Добавить правило», чтобы обучить меня."
+    else:
+        for i, r in enumerate(rules, 1):
+            text += f"{i}. {r[0]}\n"
+    
+    await message.answer(text, reply_markup=get_rules_menu())
 
-@router.message(Command("forget_rules"))
-async def cmd_forget_rules(message: Message):
-    await clear_rules(message.from_user.id)
-    await message.answer("🧹 Я забыл все правила.")
+# --- ИНЛАЙН-КНОПКИ (ДОБАВЛЕНИЕ ПРАВИЛ) ---
+@router.callback_query(F.data == "add_rule")
+async def cb_add_rule(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Напиши текст нового правила. Например:\n*Всегда пиши код с комментариями*", parse_mode="Markdown")
+    await state.set_state(BotStates.waiting_for_rule)
+    await callback.answer()
+
+@router.callback_query(F.data == "clear_rules")
+async def cb_clear_rules(callback: CallbackQuery):
+    await clear_rules(callback.from_user.id)
+    await callback.message.edit_text("🧹 Все правила удалены. Я снова чистый лист.")
+    await callback.answer()
+
+@router.message(BotStates.waiting_for_rule)
+async def process_new_rule(message: Message, state: FSMContext):
+    await add_rule(message.from_user.id, message.text)
+    await state.clear()
+    await message.answer("🧠 Запомнил новое правило!", reply_markup=get_main_menu())
 
 # --- ФОТО ---
 @router.message(F.photo)
@@ -264,11 +306,9 @@ async def handle_photo(message: Message):
         await add_to_history(user_id, "user", f"[Фото]: {caption}")
         
         user_rules = await get_rules(user_id)
-        final_system_prompt = BASE_SYSTEM_PROMPT + user_rules
-        
         history = await get_history(user_id, limit=20)
         content = [{"type": "text", "text": caption}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
-        messages = [{"role": "system", "content": final_system_prompt}] + history + [{"role": "user", "content": content}]
+        messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT + user_rules}] + history + [{"role": "user", "content": content}]
         
         response = await client.chat.completions.create(model=MODEL_ID, messages=messages, max_tokens=8000)
         answer = response.choices[0].message.content
@@ -277,7 +317,7 @@ async def handle_photo(message: Message):
         await send_code_files(message, answer)
     except Exception as e:
         await status_msg.delete()
-        await message.answer(f"Ошибка при чтении фото: {e}")
+        await message.answer(f"Ошибка: {e}")
 
 # --- ФАЙЛЫ ---
 @router.message(F.document)
@@ -298,7 +338,7 @@ async def handle_document(message: Message):
         if document.file_name.lower().endswith('.pdf'):
             try:
                 reader = PdfReader(io.BytesIO(raw_data))
-                for page in reader.pages[:30]: # Увеличено до 30 страниц PDF
+                for page in reader.pages[:30]:
                     text = page.extract_text()
                     if text: extracted_text += text + "\n"
             except:
@@ -319,7 +359,6 @@ async def handle_document(message: Message):
             return
 
         caption = message.caption or 'Проанализируй этот файл/код.'
-        # Увеличено до 80000 символов для чтения файлов
         prompt = f"Файл `{document.file_name}`:\n\n```\n{extracted_text[:80000]}\n```\n\n{caption}"
         
         await add_to_history(user_id, "user", prompt)
@@ -327,7 +366,7 @@ async def handle_document(message: Message):
         
     except Exception as e:
         await status_msg.delete()
-        await message.answer(f"Ошибка при обработке файла: {e}")
+        await message.answer(f"Ошибка: {e}")
 
 # --- ТЕКСТ И ССЫЛКИ ---
 @router.message(F.text)
@@ -341,7 +380,9 @@ async def handle_text(message: Message):
         status_msg = await message.answer("⏳ Выкачиваю текст по ссылке...")
         content = await fetch_url_text(url)
         
-        user_text = f"Пользователь прислал ссылку: {url}\n\nВот текст, который удалось с нее скачать:\n\n{content}\n\nВопрос пользователя: {user_text.replace(url, '')}"
+        # Скрытый контекст: ИИ видит текст, но не пересказывает его
+        hidden_context = f"[СИСТЕМНОЕ СООБЩЕНИЕ: Пользователь прислал ссылку {url}. Бот скачал текст. Вот он: {content}]\n\n"
+        user_text = hidden_context + user_text.replace(url, "")
     else:
         status_msg = await message.answer("⏳ Читаю и думаю...")
 
@@ -352,9 +393,9 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
     bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    print("Бот запущен!")
+    print("Бот запущен с кнопками!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
