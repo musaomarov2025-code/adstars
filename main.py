@@ -1,387 +1,135 @@
 import asyncio
-import hmac
-import hashlib
-from urllib.parse import parse_qsl
-from contextlib import asynccontextmanager
+import logging
+import os
+from collections import defaultdict
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from anthropic import AsyncAnthropic
+from dotenv import load_dotenv
 
-from config import BOT_TOKEN, WEBAPP_URL
-import database as db
-import telethon_client as tc
-from bot import webhook_handler, setup_webhook, remove_webhook
+load_dotenv()
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-# ==========================================================
-#  ПРОВЕРКА initData
-# ==========================================================
-def check_init_data(init_data: str) -> dict | None:
-    if not init_data:
-        return None
-    try:
-        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
-        received_hash = parsed.pop("hash", None)
-        if not received_hash:
-            return None
+if not BOT_TOKEN or not ANTHROPIC_API_KEY:
+    raise ValueError("Не заданы BOT_TOKEN или ANTHROPIC_API_KEY")
 
-        data_check = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
-        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+# Реестр доступных моделей: ключ — короткое имя для кнопки, значение — ID для API
+MODELS = {
+    "haiku": {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5"},
+    "sonnet": {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
+    "opus": {"id": "claude-opus-4-6", "name": "Claude Opus 4.6"},
+}
 
-        if calc != received_hash:
-            return None
-        return parsed
-    except Exception:
-        return None
+DEFAULT_MODEL_KEY = "haiku"
 
+user_histories = defaultdict(list)
+user_models = {}  # user_id -> ключ модели (например, "sonnet")
+MAX_HISTORY_LENGTH = 10
 
-async def auth(request: Request):
-    body = await request.json()
-    user = check_init_data(body.get("initData", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid initData")
-    return user
+router = Router()
+client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 
-# ==========================================================
-#  LIFESPAN
-# ==========================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    db.init()
-    await tc.client.connect()
-    if await tc.client.is_user_authorized():
-        print("✅ Telethon: авторизован")
-    else:
-        print("⚠️ Telethon: НЕ авторизован")
-
-    # Установка webhook бота
-    if WEBAPP_URL:
-        try:
-            await setup_webhook(WEBAPP_URL)
-        except Exception as e:
-            print(f"Webhook setup error: {e}")
-
-    yield
-
-    await remove_webhook()
-    await tc.client.disconnect()
+# --- Callback data для выбора модели ---
+class ModelCallback(CallbackData, prefix="model"):
+    key: str
 
 
-app = FastAPI(lifespan=lifespan)
+def get_model_name(key: str) -> str:
+    return MODELS.get(key, {}).get("name", key)
 
 
-# ==========================================================
-#  WEBHOOK (Telegram)
-# ==========================================================
-app.post("/webhook")(webhook_handler)
+def get_model_key(user_id: int) -> str:
+    return user_models.get(user_id, DEFAULT_MODEL_KEY)
 
 
-# ==========================================================
-#  СТАТУС
-# ==========================================================
-@app.post("/api/status")
-async def api_status(request: Request):
-    await auth(request)
-    authorized = False
-    if tc.client.is_connected():
-        authorized = await tc.client.is_user_authorized()
-
-    me = None
-    if authorized:
-        try:
-            u = await tc.client.get_me()
-            me = {"id": u.id, "username": u.username, "first_name": u.first_name}
-        except Exception:
-            pass
-
-    return {
-        "connected": tc.client.is_connected(),
-        "authorized": authorized,
-        "me": me,
-        "sent_today": db.get_sent_today(),
-        "daily_limit": int(db.get("bc_daily_limit", 300)),
-        "broadcast_running": tc.broadcast_running,
-        "autojoin_running": tc.autojoin_running,
-        "autotrigger_running": tc.autotrigger_running,
-    }
+# --- Клавиатура выбора модели ---
+def model_keyboard(current_key: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for key, info in MODELS.items():
+        # Отмечаем текущую модель галочкой
+        text = f"✅ {info['name']}" if key == current_key else info["name"]
+        builder.button(
+            text=text,
+            callback_data=ModelCallback(key=key).pack(),
+        )
+    builder.adjust(1)  # по одной кнопке в ряд
+    return builder.as_markup()
 
 
-# ==========================================================
-#  АВТОРИЗАЦИЯ АККАУНТА
-# ==========================================================
-@app.post("/api/login/phone")
-async def login_phone(request: Request):
-    await auth(request)
-    body = await request.json()
-    phone = body.get("phone", "").strip()
-    if not phone:
-        return {"error": "Укажи номер"}
+# --- Команда /model ---
+@router.message(Command("model"))
+async def cmd_model(message: Message):
+    user_id = message.from_user.id
+    current_key = get_model_key(user_id)
+    await message.answer(
+        f"Текущая модель: **{get_model_name(current_key)}**\n\nВыберите модель:",
+        reply_markup=model_keyboard(current_key),
+        parse_mode="Markdown",
+    )
 
-    if not tc.client.is_connected():
-        await tc.client.connect()
+
+# --- Обработка нажатия кнопки выбора модели ---
+@router.callback_query(ModelCallback.filter())
+async def process_model_choice(callback: CallbackQuery, callback_data: ModelCallback):
+    user_id = callback.from_user.id
+    new_key = callback_data.key
+
+    if new_key not in MODELS:
+        await callback.answer("Неизвестная модель.", show_alert=True)
+        return
+
+    user_models[user_id] = new_key
+    await callback.message.edit_text(
+        f"Модель изменена на **{get_model_name(new_key)}**.",
+        parse_mode="Markdown",
+        reply_markup=None,
+    )
+    await callback.answer(f"Выбрана модель: {get_model_name(new_key)}")
+
+
+# --- Обработка обычных сообщений ---
+@router.message(F.text)
+async def handle_message(message: Message):
+    user_id = message.from_user.id
+    user_text = message.text
+    model_key = get_model_key(user_id)
+    model_id = MODELS[model_key]["id"]
+
+    user_histories[user_id].append({"role": "user", "content": user_text})
+    if len(user_histories[user_id]) > MAX_HISTORY_LENGTH:
+        user_histories[user_id] = user_histories[user_id][-MAX_HISTORY_LENGTH:]
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     try:
-        await tc.client.send_code_request(phone)
-        db.set("login_phone", phone)
-        return {"step": "code"}
+        response = await client.messages.create(
+            model=model_id,
+            max_tokens=1024,
+            messages=user_histories[user_id],
+            system="Ты полезный ассистент. Отвечай кратко и по делу на русском языке.",
+        )
+        answer = response.content[0].text
+        user_histories[user_id].append({"role": "assistant", "content": answer})
+        await message.answer(answer)
     except Exception as e:
-        return {"error": str(e)}
+        logging.exception("Ошибка при запросе к Claude")
+        await message.answer(f"Произошла ошибка: {e}")
 
 
-@app.post("/api/login/code")
-async def login_code(request: Request):
-    await auth(request)
-    body = await request.json()
-    code = body.get("code", "").strip()
-    phone = db.get("login_phone")
-    if not phone or not code:
-        return {"error": "Нет номера или кода"}
-
-    try:
-        await tc.client.sign_in(phone, code)
-        return {"step": "done"}
-    except Exception as e:
-        if "password" in str(e).lower():
-            return {"step": "2fa"}
-        return {"error": str(e)}
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
 
 
-@app.post("/api/login/2fa")
-async def login_2fa(request: Request):
-    await auth(request)
-    body = await request.json()
-    password = body.get("password", "")
-    try:
-        await tc.client.sign_in(password=password)
-        return {"step": "done"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ==========================================================
-#  РАССЫЛКА
-# ==========================================================
-@app.post("/api/broadcast/start")
-async def bc_start(request: Request):
-    await auth(request)
-    if tc.broadcast_running:
-        return {"error": "Уже запущено"}
-    asyncio.create_task(tc.run_broadcast())
-    return {"ok": True}
-
-
-@app.post("/api/broadcast/stop")
-async def bc_stop(request: Request):
-    await auth(request)
-    tc.stop_broadcast()
-    return {"ok": True}
-
-
-@app.post("/api/broadcast/settings")
-async def bc_settings(request: Request):
-    await auth(request)
-    body = await request.json()
-    for key in ["bc_delay_min", "bc_delay_max", "bc_cooldown",
-                "bc_repeats", "bc_daily_limit"]:
-        if key in body:
-            db.set(key, body[key])
-    return {"ok": True}
-
-
-@app.post("/api/broadcast/settings/get")
-async def bc_settings_get(request: Request):
-    await auth(request)
-    return {
-        "bc_delay_min": db.get("bc_delay_min", 30),
-        "bc_delay_max": db.get("bc_delay_max", 90),
-        "bc_cooldown": db.get("bc_cooldown", 60),
-        "bc_repeats": db.get("bc_repeats", 1),
-        "bc_daily_limit": db.get("bc_daily_limit", 300),
-    }
-
-
-# ==========================================================
-#  ЦЕЛИ
-# ==========================================================
-@app.post("/api/targets/add")
-async def targets_add(request: Request):
-    await auth(request)
-    body = await request.json()
-    for item in body.get("items", []):
-        db.add_target(item)
-    return {"ok": True, "targets": db.all_targets()}
-
-
-@app.post("/api/targets/del")
-async def targets_del(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.del_target(body.get("chat_id"))
-    return {"ok": True, "targets": db.all_targets()}
-
-
-@app.post("/api/targets/list")
-async def targets_list(request: Request):
-    await auth(request)
-    return {"targets": db.all_targets()}
-
-
-# ==========================================================
-#  ТЕКСТЫ
-# ==========================================================
-@app.post("/api/texts/add")
-async def texts_add(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.add_text(body.get("content", "").strip())
-    return {"ok": True, "texts": db.all_texts()}
-
-
-@app.post("/api/texts/del")
-async def texts_del(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.del_text(body.get("id"))
-    return {"ok": True, "texts": db.all_texts()}
-
-
-@app.post("/api/texts/list")
-async def texts_list(request: Request):
-    await auth(request)
-    return {"texts": db.all_texts()}
-
-
-# ==========================================================
-#  АВТОПОДПИСКА
-# ==========================================================
-@app.post("/api/autojoin/admins/add")
-async def aj_add(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.add_admin(body.get("username", "").strip().lstrip("@"))
-    return {"ok": True, "admins": db.all_admins()}
-
-
-@app.post("/api/autojoin/admins/del")
-async def aj_del(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.del_admin(body.get("id"))
-    return {"ok": True, "admins": db.all_admins()}
-
-
-@app.post("/api/autojoin/list")
-async def aj_list(request: Request):
-    await auth(request)
-    return {
-        "admins": db.all_admins(),
-        "enabled": tc.autojoin_running,
-        "limit": db.get("autojoin_limit", 5),
-        "delay_min": db.get("autojoin_delay_min", 30),
-        "delay_max": db.get("autojoin_delay_max", 90),
-    }
-
-
-@app.post("/api/autojoin/toggle")
-async def aj_toggle(request: Request):
-    await auth(request)
-    tc.autojoin_running = not tc.autojoin_running
-    return {"enabled": tc.autojoin_running}
-
-
-@app.post("/api/autojoin/settings")
-async def aj_settings(request: Request):
-    await auth(request)
-    body = await request.json()
-    for key in ["autojoin_limit", "autojoin_delay_min", "autojoin_delay_max"]:
-        if key in body:
-            db.set(key, body[key])
-    return {"ok": True}
-
-
-# ==========================================================
-#  АВТОТРИГГЕР
-# ==========================================================
-@app.post("/api/trigger/words/add")
-async def tr_add(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.add_trigger(body.get("word", "").strip())
-    return {"ok": True, "words": db.all_triggers()}
-
-
-@app.post("/api/trigger/words/del")
-async def tr_del(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.del_trigger(body.get("id"))
-    return {"ok": True, "words": db.all_triggers()}
-
-
-@app.post("/api/trigger/replies/add")
-async def tr_reply_add(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.add_reply(body.get("content", "").strip())
-    return {"ok": True, "replies": db.all_replies()}
-
-
-@app.post("/api/trigger/replies/del")
-async def tr_reply_del(request: Request):
-    await auth(request)
-    body = await request.json()
-    db.del_reply(body.get("id"))
-    return {"ok": True, "replies": db.all_replies()}
-
-
-@app.post("/api/trigger/list")
-async def tr_list(request: Request):
-    await auth(request)
-    return {
-        "words": db.all_triggers(),
-        "replies": db.all_replies(),
-        "enabled": tc.autotrigger_running,
-        "add_contact": db.get("trigger_add_contact", "1"),
-        "delay_min": db.get("trigger_delay_min", 5),
-        "delay_max": db.get("trigger_delay_max", 30),
-    }
-
-
-@app.post("/api/trigger/toggle")
-async def tr_toggle(request: Request):
-    await auth(request)
-    tc.autotrigger_running = not tc.autotrigger_running
-    return {"enabled": tc.autotrigger_running}
-
-
-@app.post("/api/trigger/settings")
-async def tr_settings(request: Request):
-    await auth(request)
-    body = await request.json()
-    for key in ["trigger_add_contact", "trigger_delay_min", "trigger_delay_max"]:
-        if key in body:
-            db.set(key, body[key])
-    return {"ok": True}
-
-
-# ==========================================================
-#  ЛОГИ
-# ==========================================================
-@app.post("/api/logs")
-async def logs(request: Request):
-    await auth(request)
-    return {"logs": db.get_logs(50)}
-
-
-# ==========================================================
-#  СТАТИКА
-# ==========================================================
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
 if __name__ == "__main__":
-    import uvicorn
-    import os
-    port = int(os.getenv("PORT", 3000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    asyncio.run(main())
