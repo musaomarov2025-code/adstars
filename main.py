@@ -33,10 +33,9 @@ router = Router()
 client = AsyncOpenAI(
     api_key=XEROSHARC_API_KEY, 
     base_url=XEROSHARC_BASE_URL,
-    timeout=120.0 # Ждем до 2 минут для сложных задач
+    timeout=120.0 
 )
 
-# --- СИСТЕМНЫЙ ПРОМПТ (МОЗГ БОТА) ---
 SYSTEM_PROMPT = (
     "Ты — элитный senior-разработчик и эксперт по IT. Ты пишешь код на Python, JS/TS, Java, Kotlin, Swift, C#, C++, Go, Rust, PHP, SQL, Bash, HTML/CSS. "
     "Твои задачи: писать код с нуля, исправлять ошибки, объяснять код, писать тесты, переводить код с языка на язык. "
@@ -47,7 +46,6 @@ SYSTEM_PROMPT = (
     "Отвечай без воды, кратко и по делу. Пиши на русском."
 )
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async def fetch_url_text(url: str) -> str:
     try:
         async with aiohttp.ClientSession() as session:
@@ -59,7 +57,6 @@ async def fetch_url_text(url: str) -> str:
         return f"[Не удалось прочитать ссылку: {e}]"
 
 def split_long_text(text: str, max_length: int = 4000) -> list:
-    """Разбивает длинный текст на части, чтобы Телеграм не выдавал ошибку."""
     parts = []
     while len(text) > max_length:
         split_idx = text.rfind('\n', 0, max_length)
@@ -71,15 +68,12 @@ def split_long_text(text: str, max_length: int = 4000) -> list:
     return parts
 
 async def send_code_files(message: Message, answer: str):
-    """Ищет код, отправляет файлы, а текст режет на части."""
     pattern = r"```(?:(\w+)\s+filename=[\"'](.*?)[\"']|(\w+))\n(.*?)```"
     matches = re.findall(pattern, answer, re.DOTALL)
     
-    # Убираем код из текста для отправки обычных сообщений
     clean_text = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
     
     if clean_text:
-        # Режем текст на куски по 4000 символов
         for chunk in split_long_text(clean_text):
             await message.answer(chunk)
 
@@ -90,38 +84,52 @@ async def send_code_files(message: Message, answer: str):
             filename = custom_filename or f"snippet.{lang}"
             filename = filename.replace('"', '').replace("'", "").strip()
 
-            # Если код очень длинный, его тоже можно порезать, но лучше отправлять файлом целиком
             file_bytes = code.strip().encode('utf-8')
             doc = BufferedInputFile(file=file_bytes, filename=filename)
             await message.answer_document(document=doc)
     elif not clean_text:
-        # Если это просто гигантский код без текста, который не обернули в блоки
         for chunk in split_long_text(answer):
             await message.answer(chunk)
 
-async def process_ai_response(message: Message, user_id: int):
-    async with message.bot.send_chat_action(chat_id=message.chat.id, action="typing"):
-        try:
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + user_histories[user_id][-MAX_HISTORY_LENGTH:]
-            
-            response = await client.chat.completions.create(
-                model=MODEL_ID,
-                messages=messages,
-                max_tokens=4000,
-            )
-            answer = response.choices[0].message.content
-            user_histories[user_id].append({"role": "assistant", "content": answer})
-            
-            await send_code_files(message, answer)
+async def process_ai_response(message: Message, user_id: int, status_msg: Message = None):
+    # ИСПРАВЛЕНА ОШИБКА: теперь просто вызываем await
+    try:
+        await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    except:
+        pass
 
-        except Exception as e:
-            logging.exception("Ошибка API")
-            if "503" in str(e) or "502" in str(e):
-                await message.answer("⚠️ Сервера провайдера перегружены. Подожди минуту и попробуй снова.")
-            else:
-                await message.answer(f"Произошла ошибка: {e}")
+    try:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + user_histories[user_id][-MAX_HISTORY_LENGTH:]
+        
+        response = await client.chat.completions.create(
+            model=MODEL_ID,
+            messages=messages,
+            max_tokens=4000,
+        )
+        answer = response.choices[0].message.content
+        user_histories[user_id].append({"role": "assistant", "content": answer})
+        
+        # Удаляем сообщение "⏳ Думаю...", если оно было
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except:
+                pass
+                
+        await send_code_files(message, answer)
 
-# --- КОМАНДЫ ---
+    except Exception as e:
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except:
+                pass
+        logging.exception("Ошибка API")
+        if "503" in str(e) or "502" in str(e):
+            await message.answer("⚠️ Сервера провайдера перегружены. Подожди минуту и попробуй снова.")
+        else:
+            await message.answer(f"Произошла ошибка: {e}")
+
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -135,11 +143,10 @@ async def cmd_clear(message: Message):
     user_histories[message.from_user.id].clear()
     await message.answer("🧹 Контекст очищен. Начинаем сначала.")
 
-# --- ФОТО ---
 @router.message(F.photo)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
-    status_msg = await message.answer("👀 Смотрю скриншот...")
+    status_msg = await message.answer("⏳ Смотрю скриншот...")
     try:
         photo = message.photo[-1]
         file_info = await message.bot.get_file(photo.file_id)
@@ -151,13 +158,11 @@ async def handle_photo(message: Message):
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
         ]
         user_histories[user_id].append({"role": "user", "content": content})
-        await status_msg.delete()
-        await process_ai_response(message, user_id)
+        await process_ai_response(message, user_id, status_msg)
     except Exception as e:
         await status_msg.delete()
         await message.answer(f"Ошибка при чтении фото: {e}")
 
-# --- ФАЙЛЫ (PDF, TXT, КОД) ---
 @router.message(F.document)
 async def handle_document(message: Message):
     user_id = message.from_user.id
@@ -166,7 +171,7 @@ async def handle_document(message: Message):
         await message.answer("Файл слишком большой. Максимум 15 МБ.")
         return
 
-    status_msg = await message.answer("📄 Изучаю файл...")
+    status_msg = await message.answer("⏳ Изучаю файл...")
     try:
         file_info = await message.bot.get_file(document.file_id)
         file_bytes = await message.bot.download_file(file_info.file_path)
@@ -198,13 +203,11 @@ async def handle_document(message: Message):
 
         prompt = f"Файл `{document.file_name}`:\n\n```\n{extracted_text[:20000]}\n```\n\n{message.caption or 'Проанализируй/исправь.'}"
         user_histories[user_id].append({"role": "user", "content": prompt})
-        await status_msg.delete()
-        await process_ai_response(message, user_id)
+        await process_ai_response(message, user_id, status_msg)
     except Exception as e:
         await status_msg.delete()
         await message.answer(f"Ошибка при обработке файла: {e}")
 
-# --- ТЕКСТ И ССЫЛКИ ---
 @router.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
@@ -213,13 +216,14 @@ async def handle_text(message: Message):
     url_match = re.search(r'(https?://[^\s]+)', user_text)
     if url_match:
         url = url_match.group(1)
-        status = await message.answer("🌐 Читаю сайт...")
+        status_msg = await message.answer("⏳ Читаю сайт...")
         content = await fetch_url_text(url)
-        await status.delete()
         user_text = user_text.replace(url, f"\n[Текст с сайта]:\n{content}\n")
+    else:
+        status_msg = await message.answer("⏳ Думаю...")
 
     user_histories[user_id].append({"role": "user", "content": user_text})
-    await process_ai_response(message, user_id)
+    await process_ai_response(message, user_id, status_msg)
 
 async def main():
     logging.basicConfig(level=logging.INFO)
