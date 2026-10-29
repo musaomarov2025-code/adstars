@@ -35,16 +35,19 @@ client = AsyncOpenAI(
     timeout=120.0 
 )
 
+# ЖЕСТКИЙ ПРОМПТ, ЧТОБЫ ОН НЕ ТУПИЛ И НЕ ПРОСИЛ ТЕКСТ ЗАНОВО
 SYSTEM_PROMPT = (
-    "Ты — элитный senior-разработчик и эксперт по IT. Ты пишешь код на Python, JS/TS, Java, Kotlin, Swift, C#, C++, Go, Rust, PHP, SQL, Bash, HTML/CSS. "
-    "Твои задачи: писать код с нуля, исправлять ошибки, объяснять код, писать тесты, переводить код с языка на язык. "
-    "Ты помогаешь с Telegram-ботами, парсерами, API, сайтами, базами данных и pandas. "
+    "Ты — профессиональный программист и ИИ-ассистент. "
+    "Твоя главная задача — писать код, разбирать ошибки и создавать проекты. "
+    "ВАЖНО: Если пользователь присылает длинный текст, список или техническое задание (ТЗ), ты ОБЯЗАН внимательно его прочитать и сразу выдать ответ. "
+    "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать 'Пришлите текст', 'Я не вижу текст' или 'Напишите, что должен делать бот', если текст УЖЕ ЕСТЬ в сообщении. "
+    "Если тебе прислали ТЗ, проанализируй его и выдай структуру проекта, либо начни писать код. "
     "ФОРМАТИРОВАНИЕ: ВСЕГДА оборачивай код в Markdown-блоки с указанием имени файла. Пример: ```python filename=\"main.py\"\nprint('hi')\n```. "
     "Если файлов несколько, используй отдельный блок для каждого. Никогда не пиши 'я не могу создать файл'. "
     "Отвечай без воды, кратко и по делу. Пиши на русском."
 )
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
+# --- БАЗА ДАННЫХ (ПАМЯТЬ) ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -66,34 +69,48 @@ async def add_to_history(user_id: int, role: str, content: str):
         )
         await db.commit()
 
-async def get_history(user_id: int, limit: int = 40):
+async def get_history(user_id: int, limit: int = 30):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute(
             "SELECT role, content FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
             (user_id, limit)
         )
         rows = await cursor.fetchall()
-        history = [{"role": row[0], "content": row[1]} for row in reversed(rows)]
-        return history
+        return [{"role": row[0], "content": row[1]} for row in reversed(rows)]
 
 async def clear_history(user_id: int):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
         await db.commit()
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- ЧТЕНИЕ ССЫЛОК (С ПОДДЕРЖКОЙ TELEGRAM) ---
 async def fetch_url_text(url: str) -> str:
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        
+        # Превращаем t.me/название/пост в t.me/s/название/пост (веб-версия с текстом)
+        if "t.me/" in url and "/s/" not in url:
+            url = url.replace("t.me/", "t.me/s/")
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=15) as response:
-                soup = BeautifulSoup(await response.text(), 'html.parser')
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # Если это Telegram, ищем конкретный блок с текстом поста
+                if "t.me" in url:
+                    message_text = soup.find("div", class_="tgme_widget_message_text")
+                    if message_text:
+                        return message_text.get_text(separator='\n', strip=True)
+                
+                # Для обычных сайтов
                 for script in soup(["script", "style", "noscript"]): script.extract()
                 text = ' '.join(soup.get_text(separator=' ').split())
                 return text[:8000]
     except Exception as e:
         return f"[Не удалось прочитать ссылку: {e}]"
 
+# --- ОТПРАВКА КОДА ФАЙЛАМИ ---
 def split_long_text(text: str, max_length: int = 4000) -> list:
     parts = []
     while len(text) > max_length:
@@ -109,10 +126,12 @@ async def send_code_files(message: Message, answer: str):
     matches = re.findall(pattern, answer, re.DOTALL)
     clean_text = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
     
+    # Отправляем текст без кода
     if clean_text:
         for chunk in split_long_text(clean_text):
             await message.answer(chunk)
 
+    # Отправляем файлы
     if matches:
         for m in matches:
             lang, custom_filename, default_lang, code = m
@@ -126,13 +145,14 @@ async def send_code_files(message: Message, answer: str):
         for chunk in split_long_text(answer):
             await message.answer(chunk)
 
+# --- ЗАПРОС К НЕЙРОСЕТИ ---
 async def process_ai_response(message: Message, user_id: int, status_msg: Message = None):
     try:
         await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     except: pass
 
     try:
-        history = await get_history(user_id, limit=40)
+        history = await get_history(user_id, limit=30)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
         
         response = await client.chat.completions.create(
@@ -164,14 +184,13 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! Я твой ИИ-разработчик.\n\n"
-        "⚠️ Если у тебя очень длинный текст (больше 1-2 экранов), "
-        "сохрани его в файл `.txt` и отправь мне. Я прочитаю всё целиком!"
+        "Скидывай мне ТЗ, ссылки на посты в ТГ, файлы или фото. Я всё прочитаю и выдам готовый код файлами."
     )
 
 @router.message(Command("clear"))
 async def cmd_clear(message: Message):
     await clear_history(message.from_user.id)
-    await message.answer("🧹 Память полностью очищена.")
+    await message.answer("🧹 Память полностью очищена. Можем начать заново.")
 
 # --- ФОТО ---
 @router.message(F.photo)
@@ -187,10 +206,7 @@ async def handle_photo(message: Message):
         caption = message.caption or "Разбери этот скриншот."
         await add_to_history(user_id, "user", f"[Фото]: {caption}")
         
-        try: await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-        except: pass
-        
-        history = await get_history(user_id, limit=20)
+        history = await get_history(user_id, limit=15)
         content = [{"type": "text", "text": caption}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": content}]
         
@@ -227,7 +243,7 @@ async def handle_document(message: Message):
                     if text: extracted_text += text + "\n"
             except:
                 await status_msg.delete()
-                await message.answer("Не удалось прочитать PDF (возможно, это сканы).")
+                await message.answer("Не удалось прочитать PDF.")
                 return
         else:
             try:
@@ -242,8 +258,8 @@ async def handle_document(message: Message):
             await message.answer("Файл пустой.")
             return
 
-        caption = message.caption or 'Проанализируй этот файл/код.'
-        prompt = f"Файл `{document.file_name}`:\n\n```\n{extracted_text[:20000]}\n```\n\n{caption}"
+        caption = message.caption or 'Проанализируй этот файл/код и напиши, что с ним не так, или доработай.'
+        prompt = f"Файл `{document.file_name}`:\n\n```\n{extracted_text[:25000]}\n```\n\n{caption}"
         
         await add_to_history(user_id, "user", prompt)
         await process_ai_response(message, user_id, status_msg)
@@ -256,23 +272,16 @@ async def handle_document(message: Message):
 @router.message(F.text)
 async def handle_text(message: Message):
     user_id = message.from_user.id
+    user_text = message.text
     
-    # Берем текст с форматированием (чтобы жирный шрифт и списки не ломались)
-    user_text = message.html_text if message.html_text else message.text
-    
-    # Если текст СЛИШКОМ длинный - предупреждаем
-    if len(user_text) > 5000:
-        await message.answer("⚠️ Твой текст слишком длинный для одного сообщения (сервер может его обрезать).\nПожалуйста, сохрани его в файл `.txt` и отправь мне документом.")
-        return
-
     url_match = re.search(r'(https?://[^\s]+)', user_text)
     if url_match:
         url = url_match.group(1)
-        status_msg = await message.answer("⏳ Читаю сайт...")
+        status_msg = await message.answer("⏳ Читаю сайт/пост...")
         content = await fetch_url_text(url)
-        user_text = user_text.replace(url, f"\n[Текст с сайта]:\n{content}\n")
+        user_text = user_text.replace(url, f"\n[Текст по ссылке]:\n{content}\n")
     else:
-        status_msg = await message.answer("⏳ Думаю...")
+        status_msg = await message.answer("⏳ Читаю и думаю...")
 
     await add_to_history(user_id, "user", user_text)
     await process_ai_response(message, user_id, status_msg)
