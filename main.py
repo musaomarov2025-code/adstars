@@ -6,7 +6,6 @@ import os
 import re
 import aiohttp
 import aiosqlite
-import aiofiles
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
@@ -28,13 +27,14 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 XEROSHARC_API_KEY = os.getenv("XEROSHARC_API_KEY")
 XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1")
-BACKUP_CHAT_ID = os.getenv("BACKUP_CHAT_ID") # Твой ID для сохранения базы
+BACKUP_CHAT_ID = os.getenv("BACKUP_CHAT_ID") 
 DB_FILE = "bot_memory.db"
 
 if not BOT_TOKEN or not XEROSHARC_API_KEY or not BACKUP_CHAT_ID:
     raise ValueError("Не заданы BOT_TOKEN, XEROSHARC_API_KEY или BACKUP_CHAT_ID!")
 
-MODEL_ID = "claude-sonnet-4-6" 
+# Используем самую мощную модель с твоего нового тарифа
+MODEL_ID = "claude-opus-5-5" 
 
 router = Router()
 client = AsyncOpenAI(
@@ -46,6 +46,7 @@ client = AsyncOpenAI(
 class BotStates(StatesGroup):
     waiting_for_rule = State()
 
+# --- СИСТЕМНЫЙ ПРОМПТ ---
 BASE_SYSTEM_PROMPT = (
     "Ты — профессиональный программист и ИИ-ассистент. "
     "ВНИМАНИЕ: Твой бэкенд (бот) уже скачал текст по ссылке и передал его тебе. "
@@ -120,32 +121,19 @@ async def list_rules(user_id: int) -> list:
 
 # --- БЭКАП В ТЕЛЕГРАМ ---
 async def backup_database(bot: Bot):
-    """Отправляет файл БД в Избранное (или указанный чат)"""
     if os.path.exists(DB_FILE):
         try:
             await bot.send_document(
                 chat_id=BACKUP_CHAT_ID, 
                 document=FSInputFile(DB_FILE), 
-                caption="💾 Авто-бэкап базы данных"
+                caption="💾 Авто-бэкап базы данных бота"
             )
         except Exception as e:
             logging.error(f"Ошибка бэкапа: {e}")
 
-async def restore_database(bot: Bot):
-    """Пытается скачать последнюю БД из Избранного при запуске"""
-    try:
-        # Ищем последний файл .db в истории чата
-        # Примечание: для простоты просим пользователя закрепить бэкап, 
-        # либо просто полагаемся на то, что при первом запуске файла нет.
-        # В Telegram API сложно искать историю без явных ID сообщений.
-        pass 
-    except Exception as e:
-        logging.error(f"Ошибка восстановления: {e}")
-
 async def auto_backup_task(bot: Bot):
-    """Фоновая задача для бэкапа каждые 10 минут"""
     while True:
-        await asyncio.sleep(600) # 10 минут
+        await asyncio.sleep(600) # Каждые 10 минут
         await backup_database(bot)
 
 # --- ПАРСИНГ И ОТПРАВКА ---
@@ -155,8 +143,8 @@ async def fetch_url_text(url: str) -> str:
         async with aiohttp.ClientSession() as session:
             async with session.get(jina_url, timeout=60) as response:
                 if response.status == 200:
-                    return (await response.text())[:80000]
-                return "[Ошибка чтения]"
+                    return (await response.text())[:80000] # Читаем до 80к символов
+                return "[Ошибка чтения сайта]"
     except Exception as e:
         return f"[Ошибка: {e}]"
 
@@ -189,16 +177,20 @@ async def send_code_files(message: Message, answer: str):
             lang, custom_filename, code = m
             lang = lang or "txt"
             code_stripped = code.strip()
+            
+            # Если есть имя файла или код длинный - шлем файлом
             if custom_filename or len(code_stripped) > 150:
                 filename = custom_filename.replace('"', '').replace("'", "").strip() if custom_filename else f"snippet.{lang}"
                 doc = BufferedInputFile(file=code_stripped.encode('utf-8'), filename=filename)
                 await message.answer_document(document=doc)
             else:
+                # Короткие примеры шлем текстом
                 await safe_answer(message, f"```{lang}\n{code_stripped}\n```")
     elif not clean_text:
         for chunk in split_long_text(answer):
             await safe_answer(message, chunk)
 
+# --- ЗАПРОС К НЕЙРОСЕТИ ---
 async def process_ai_response(message: Message, user_id: int, status_msg: Message = None):
     try: await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     except: pass
@@ -208,20 +200,11 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
         history = await get_history(user_id, limit=50)
         messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT + user_rules}] + history
         
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = await client.chat.completions.create(model=MODEL_ID, messages=messages, max_tokens=8000)
-                break
-            except Exception as e:
-                error_str = str(e)
-                if ("429" in error_str or "rate_limit" in error_str.lower()) and attempt < max_retries - 1:
-                    if status_msg:
-                        try: await status_msg.edit_text("⏳ Сервер перегружен, жду 5 секунд...")
-                        except: pass
-                    await asyncio.sleep(5)
-                else:
-                    raise e
+        response = await client.chat.completions.create(
+            model=MODEL_ID, 
+            messages=messages, 
+            max_tokens=8000
+        )
 
         answer = response.choices[0].message.content
         await add_to_history(user_id, "assistant", answer)
@@ -237,20 +220,24 @@ async def process_ai_response(message: Message, user_id: int, status_msg: Messag
             try: await status_msg.delete()
             except: pass
         logging.exception("Ошибка API")
+        
         error_str = str(e)
-        if "429" in error_str or "rate_limit" in error_str.lower():
-            await message.answer("⚠️ **Слишком много запросов!** Подожди 1-2 минуты.")
+        if "429" in error_str:
+            await message.answer("⚠️ Сервер говорит, что запросы идут слишком быстро. Подожди 10 секунд.")
+        elif "403" in error_str:
+            await message.answer("⚠️ **Токены закончились!** Проверь баланс на сайте.")
         elif "503" in error_str or "502" in error_str:
-            await message.answer("⚠️ Сервера перегружены. Подожди минуту.")
+            await message.answer("⚠️ Сервера провайдера перегружены. Подожди минуту.")
         else:
             await message.answer(f"Произошла ошибка: {e}")
 
-# --- КОМАНДЫ И КНОПКИ ---
+# --- ОБРАБОТЧИКИ ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Я твой ИИ-разработчик.\n\n"
-        "💾 **У меня включен авто-бэкап памяти.** Каждые 10 минут я сохраняю свою базу в твои «Избранное» (Saved Messages).",
+        "👋 Привет! Я твой ИИ-разработчик на базе Claude Opus 5.5.\n\n"
+        "💾 У меня включен авто-бэкап памяти.\n"
+        "Скидывай мне ТЗ, ссылки, фото или файлы — я всё прочитаю и выполню.",
         reply_markup=get_main_menu()
     )
 
@@ -266,7 +253,7 @@ async def btn_clear(message: Message):
 
 @router.message(F.text == "❓ Помощь")
 async def btn_help(message: Message):
-    await message.answer("Просто пиши задачи! Я пишу код, читаю файлы и помню контекст.", reply_markup=get_main_menu())
+    await message.answer("Просто пиши задачи! Я пишу код, читаю ссылки (через Jina AI) и помню контекст.", reply_markup=get_main_menu())
 
 @router.message(F.text == "🧠 Мои правила")
 async def btn_rules(message: Message):
@@ -277,7 +264,7 @@ async def btn_rules(message: Message):
 
 @router.callback_query(F.data == "add_rule")
 async def cb_add_rule(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("Напиши текст нового правила:")
+    await callback.message.answer("Напиши текст нового правила. Например: `Всегда пиши код с комментариями`", parse_mode="Markdown")
     await state.set_state(BotStates.waiting_for_rule)
     await callback.answer()
 
@@ -293,7 +280,7 @@ async def process_new_rule(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("🧠 Запомнил новое правило!", reply_markup=get_main_menu())
 
-# --- ФОТО, ФАЙЛЫ, ТЕКСТ ---
+# --- ФОТО ---
 @router.message(F.photo)
 async def handle_photo(message: Message):
     status_msg = await message.answer("⏳ Смотрю скриншот...")
@@ -316,19 +303,22 @@ async def handle_photo(message: Message):
         await status_msg.delete()
         await message.answer(f"Ошибка: {e}")
 
+# --- ФАЙЛЫ ---
 @router.message(F.document)
 async def handle_document(message: Message):
-    if message.document.file_size > 15 * 1024 * 1024:
-        await message.answer("Файл слишком большой.")
+    if message.document.file_size > 20 * 1024 * 1024:
+        await message.answer("Файл слишком большой (макс 20 МБ).")
         return
     status_msg = await message.answer("⏳ Изучаю файл...")
     try:
         file_bytes = await message.bot.download_file((await message.bot.get_file(message.document.file_id)).file_path)
         raw_data = file_bytes.read()
         extracted_text = ""
+        
         if message.document.file_name.lower().endswith('.pdf'):
             reader = PdfReader(io.BytesIO(raw_data))
-            for page in reader.pages[:30]: extracted_text += (page.extract_text() or "") + "\n"
+            for page in reader.pages[:50]: 
+                extracted_text += (page.extract_text() or "") + "\n"
         else:
             extracted_text = raw_data.decode('utf-8')
 
@@ -337,16 +327,19 @@ async def handle_document(message: Message):
         await process_ai_response(message, message.from_user.id, status_msg)
     except Exception as e:
         await status_msg.delete()
-        await message.answer(f"Ошибка: {e}")
+        await message.answer(f"Ошибка чтения файла: {e}")
 
+# --- ТЕКСТ И ССЫЛКИ ---
 @router.message(F.text)
 async def handle_text(message: Message):
     user_text = message.text
     url_match = re.search(r'(https?://[^\s]+)', user_text)
+    
     if url_match:
         url = url_match.group(1)
         status_msg = await message.answer("⏳ Выкачиваю текст по ссылке...")
         content = await fetch_url_text(url)
+        # Скрытый контекст: нейросеть видит текст, но промпт запрещает ей его пересказывать
         user_text = f"[СИСТЕМНОЕ СООБЩЕНИЕ: Бот скачал текст по ссылке {url}. Вот он: {content}]\n\n" + user_text.replace(url, "")
     else:
         status_msg = await message.answer("⏳ Читаю и думаю...")
@@ -359,12 +352,12 @@ async def main():
     await init_db()
     bot = Bot(token=BOT_TOKEN)
     
-    # Запускаем фоновую задачу бэкапа
+    # Запускаем фоновое сохранение базы каждые 10 минут
     asyncio.create_task(auto_backup_task(bot))
     
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    print("Бот запущен с авто-бэкапом!")
+    print("Бот запущен на Claude Opus 5.5!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
