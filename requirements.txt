@@ -5,5 +5,4 @@ aiohttp
 beautifulsoup4
 pypdf
 aiosqlite
-youtube-transcript-api
 PyGithub
