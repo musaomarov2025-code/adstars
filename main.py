@@ -8,10 +8,8 @@ import zipfile
 import aiohttp
 import aiosqlite
 import datetime
-import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-from youtube_transcript_api import YouTubeTranscriptApi
 from github import Github
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -43,8 +41,6 @@ client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, tim
 class BotStates(StatesGroup):
     waiting_for_rule = State()
     waiting_for_chat_name = State()
-    waiting_for_search = State()
-    waiting_for_reminder_time = State()
     waiting_for_reminder_text = State()
     waiting_for_github_token = State()
     waiting_for_github_repo = State()
@@ -58,9 +54,9 @@ ROLES = {
 
 BASE_SYSTEM_PROMPT = (
     "{role_prompt}\n"
-    "Если нужно подумать, используй <thinking>твои мысли</thinking>. "
+    "ВАЖНО: У тебя ЕСТЬ доступ к GitHub через твоего Python-помощника. Если пользователь просит загрузить код, просто ответь: 'Загружаю код в репозиторий...' и остановись. Бэкенд сам всё сделает.\n"
+    "Если тебе нужны свежие данные из интернета (новости, погода, курсы, документация, которой ты не знаешь), напиши СТРОГО тег [SEARCH: твой запрос] и остановись. Бот сам найдет информацию и вернет ее тебе. "
     "Если пишешь код для проекта, ВСЕГДА указывай имя файла: ```python filename=\"main.py\"\n...\n```. "
-    "Если просят сделать Mermaid-схему, напиши ```mermaid\nграф\n```. "
     "Отвечай на русском."
 )
 
@@ -68,10 +64,9 @@ BASE_SYSTEM_PROMPT = (
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📂 Мои диалоги"), KeyboardButton(text="➕ Новый диалог")],
-        [KeyboardButton(text="🔍 Поиск в интернете"), KeyboardButton(text="🎭 Сменить роль")],
-        [KeyboardButton(text="📁 Файлы проекта"), KeyboardButton(text="⏰ Напоминания")],
-        [KeyboardButton(text="🐙 GitHub Деплой"), KeyboardButton(text="🧹 Очистить чат")],
-        [KeyboardButton(text="🧠 Правила"), KeyboardButton(text="❓ Помощь")]
+        [KeyboardButton(text="🎭 Сменить роль"), KeyboardButton(text="📁 Файлы проекта")],
+        [KeyboardButton(text="⏰ Напоминания"), KeyboardButton(text="🐙 GitHub Деплой")],
+        [KeyboardButton(text="🧹 Очистить чат"), KeyboardButton(text="🧠 Правила"), KeyboardButton(text="❓ Помощь")]
     ], resize_keyboard=True)
 
 def get_chats_menu(chats):
@@ -81,6 +76,9 @@ def get_chats_menu(chats):
 
 def get_roles_menu():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=r, callback_data=f"role_{r}")] for r in ROLES.keys()])
+
+def get_cancel_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]])
 
 # --- БАЗА ДАННЫХ ---
 async def init_db():
@@ -106,28 +104,22 @@ async def get_settings(user_id):
         cursor = await db.execute("SELECT gh_token, gh_repo FROM settings WHERE user_id = ?", (user_id,))
         return await cursor.fetchone()
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-async def safe_answer(message: Message, text: str):
-    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
-    if not text: return
-    try: await message.answer(text, parse_mode="Markdown")
-    except: await message.answer(text)
-
+# --- ИНТЕРНЕТ И ПОИСК ---
 async def fetch_url(url: str):
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"https://r.jina.ai/{url}", timeout=60) as r:
-                return (await r.text())[:60000] if r.status == 200 else "[Ошибка]"
+                return (await r.text())[:60000] if r.status == 200 else "[Ошибка чтения]"
     except: return "[Ошибка]"
 
 async def search_web(query: str):
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"https://s.jina.ai/{query}", timeout=60) as r:
-                return (await r.text())[:20000] if r.status == 200 else "[Ошибка]"
+                return (await r.text())[:20000] if r.status == 200 else "[Ошибка поиска]"
     except: return "[Ошибка]"
 
-# --- ФОНОВАЯ ЗАДАЧА ДЛЯ НАПОМИНАНИЙ ---
+# --- НАПОМИНАНИЯ ---
 async def reminder_worker(bot: Bot):
     while True:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -141,11 +133,10 @@ async def reminder_worker(bot: Bot):
             await db.commit()
         await asyncio.sleep(30)
 
-# --- ОТПРАВКА КОДА И ФАЙЛОВ ---
-async def process_files_and_mermaid(message: Message, answer: str):
+# --- ОТПРАВКА ФАЙЛОВ ---
+async def process_files(message: Message, answer: str):
     answer = re.sub(r"<thinking>.*?</thinking>", "", answer, flags=re.DOTALL).strip()
     
-    # Mermaid схемы
     mer = re.findall(r"```mermaid\n(.*?)```", answer, re.DOTALL)
     for graph in mer:
         b64 = base64.urlsafe_b64encode(graph.strip().encode('utf-8')).decode('utf-8')
@@ -155,7 +146,6 @@ async def process_files_and_mermaid(message: Message, answer: str):
             answer = answer.replace(f"```mermaid\n{graph}```", "")
         except: pass
 
-    # Файлы кода
     pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
     matches = re.findall(pattern, answer, re.DOTALL)
     clean = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
@@ -164,7 +154,6 @@ async def process_files_and_mermaid(message: Message, answer: str):
 
     if matches:
         if len(matches) > 1:
-            # Если файлов много - делаем ZIP
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for fname, code in matches:
@@ -173,15 +162,21 @@ async def process_files_and_mermaid(message: Message, answer: str):
             doc = BufferedInputFile(file=zip_buffer.read(), filename="project.zip")
             await message.answer_document(document=doc, caption="📦 Все файлы проекта в ZIP")
         else:
-            # Если один файл - шлем просто так
             fname, code = matches[0]
             doc = BufferedInputFile(file=code.strip().encode('utf-8'), filename=fname.strip())
             await message.answer_document(document=doc)
+
+async def safe_answer(message: Message, text: str):
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
+    if not text: return
+    try: await message.answer(text, parse_mode="Markdown")
+    except: await message.answer(text)
 
 # --- ЗАПРОС К НЕЙРОСЕТИ ---
 async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: Message = None, extra: str = ""):
     try: await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     except: pass
+    
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             cursor = await db.execute("SELECT summary, role FROM chats WHERE id = ?", (chat_id,))
@@ -199,6 +194,7 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
 
         msgs = [{"role": "system", "content": sys_prompt}] + history
         resp = None
+        
         for model in ["claude-sonnet-4-6", "gpt-6.1-sol"]:
             try:
                 if status_msg: await status_msg.edit_text(f"⏳ {role} думает...")
@@ -209,6 +205,20 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
                 else: raise e
 
         ans = resp.choices[0].message.content
+        
+        search_match = re.search(r'\[SEARCH:\s*(.*?)\]', ans)
+        if search_match:
+            query = search_match.group(1).strip()
+            if status_msg: await status_msg.edit_text(f"🌐 Ищу в интернете: {query}...")
+            search_results = await search_web(query)
+            
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Результат поиска '{query}']:\n{search_results}"))
+                await db.commit()
+                
+            await ai_request(message, user_id, chat_id, status_msg, extra=f"Результаты поиска '{query}':\n{search_results}\n\nОтветь на предыдущий вопрос, используя эту информацию.")
+            return
+
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", ans))
             await db.commit()
@@ -216,26 +226,58 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
         if status_msg:
             try: await status_msg.delete()
             except: pass
-        await process_files_and_mermaid(message, ans)
+        await process_files(message, ans)
+        
     except Exception as e:
         if status_msg:
             try: await status_msg.delete()
             except: pass
         await message.answer(f"⚠️ Ошибка: {e}")
 
-# --- ОБРАБОТЧИКИ КНОПОК ---
+# --- ОБРАБОТЧИКИ КОМАНД И КНОПОК ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой продвинутый ИИ-ассистент.\n\nЯ умею искать, читать, напоминать и пушить код в GitHub!", reply_markup=get_main_menu())
+    await message.answer("👋 Привет! Я твой продвинутый ИИ-ассистент.\n\nЯ умею искать в интернете, читать файлы, напоминать и пушить код в GitHub!", reply_markup=get_main_menu())
+
+@router.message(F.text == "➕ Новый диалог")
+async def btn_new_chat(message: Message, state: FSMContext):
+    await message.answer("Напиши название для нового диалога (или нажми кнопку ниже):", reply_markup=get_cancel_menu())
+    await state.set_state(BotStates.waiting_for_chat_name)
+
+@router.callback_query(F.data == "cancel_action")
+async def cancel_action(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Действие отменено.")
+    await callback.answer()
+
+@router.message(BotStates.waiting_for_chat_name)
+async def create_chat(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT INTO chats (user_id, title, summary, role) VALUES (?, ?, ?, ?)", (message.from_user.id, message.text.strip(), "", "Обычный"))
+        await db.commit()
+    await state.clear()
+    await message.answer(f"✅ Создан диалог: **{message.text}**", reply_markup=get_main_menu(), parse_mode="Markdown")
+
+@router.message(F.text == "📂 Мои диалоги")
+async def btn_chats(message: Message):
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT id, title FROM chats WHERE user_id = ? ORDER BY id DESC", (message.from_user.id,))
+        chats = await cursor.fetchall()
+    await message.answer("Выбери диалог:", reply_markup=get_chats_menu(chats))
+
+@router.callback_query(F.data.startswith("switch_"))
+async def switch_chat(callback: CallbackQuery):
+    await callback.message.edit_text("✅ Диалог выбран. Пиши задачу.")
+    await callback.answer()
 
 @router.message(F.text == "🐙 GitHub Деплой")
 async def btn_github(message: Message, state: FSMContext):
     settings = await get_settings(message.from_user.id)
     if settings and settings[0] and settings[1]:
-        await message.answer(f"✅ GitHub подключен.\nРепозиторий: `{settings[1]}`\nНапиши 'Создай файл test.txt с текстом Привет', и я загружу его в твой репо.", parse_mode="Markdown")
+        await message.answer(f"✅ GitHub подключен.\nРепозиторий: `{settings[1]}`\nПросто попроси меня написать код и скажи 'Загрузи в GitHub'.", parse_mode="Markdown")
     else:
-        await message.answer("🔑 Отправь мне свой GitHub Personal Access Token (с правами repo):")
+        await message.answer("🔑 Отправь мне свой GitHub Token (с правами repo):", reply_markup=get_cancel_menu())
         await state.set_state(BotStates.waiting_for_github_token)
 
 @router.message(BotStates.waiting_for_github_token)
@@ -244,56 +286,48 @@ async def save_gh_token(message: Message, state: FSMContext):
         await db.execute("INSERT OR IGNORE INTO settings (user_id, gh_token) VALUES (?, ?)", (message.from_user.id, message.text.strip()))
         await db.execute("UPDATE settings SET gh_token = ? WHERE user_id = ?", (message.text.strip(), message.from_user.id))
         await db.commit()
-    await message.answer("📂 Теперь отправь название репозитория в формате `username/repo` (например: `ivan/mybot`):")
+    await message.answer("📂 Теперь отправь название репозитория в формате `логин/название`:", reply_markup=get_cancel_menu(), parse_mode="Markdown")
     await state.set_state(BotStates.waiting_for_github_repo)
 
 @router.message(BotStates.waiting_for_github_repo)
 async def save_gh_repo(message: Message, state: FSMContext):
+    repo_name = message.text.strip()
+    
+    if "/" not in repo_name:
+        await message.answer(
+            "❌ **Ошибка!**\nТы ввел просто название репозитория.\n"
+            "GitHub требует формат: `логин/название`.\n\n"
+            "Например: `musaomarov2025-code/NoobGift`\n"
+            "Попробуй еще раз:", reply_markup=get_cancel_menu()
+        )
+        return
+        
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE settings SET gh_repo = ? WHERE user_id = ?", (message.text.strip(), message.from_user.id))
+        await db.execute("UPDATE settings SET gh_repo = ? WHERE user_id = ?", (repo_name, message.from_user.id))
         await db.commit()
     await state.clear()
-    await message.answer("✅ GitHub успешно подключен! Теперь, если ты попросишь написать код, я могу закинуть его прямо в репозиторий.", reply_markup=get_main_menu())
+    await message.answer("✅ GitHub успешно подключен! Теперь я умею загружать код.", reply_markup=get_main_menu())
 
 @router.message(F.text == "⏰ Напоминания")
 async def btn_reminders(message: Message, state: FSMContext):
-    await message.answer("⏰ Напиши время и текст напоминания в формате:\n`2026-10-30 18:00 Проверить сервер`", parse_mode="Markdown")
+    await message.answer("⏰ Напиши время и текст в формате:\n`2026-10-30 18:00 Проверить сервер`", reply_markup=get_cancel_menu(), parse_mode="Markdown")
     await state.set_state(BotStates.waiting_for_reminder_text)
 
 @router.message(BotStates.waiting_for_reminder_text)
 async def set_reminder(message: Message, state: FSMContext):
     try:
-        # Простейший парсинг
         parts = message.text.split(" ", 2)
         dt_str = f"{parts[0]} {parts[1]}"
         text = parts[2]
-        # Проверка формата
         datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-        
         chat_id = await get_chat_id(message.from_user.id)
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute("INSERT INTO reminders (user_id, chat_id, remind_time, text) VALUES (?, ?, ?, ?)", (message.from_user.id, chat_id, dt_str, text))
             await db.commit()
-        await message.answer(f"✅ Напоминание установлено на {dt_str}!", reply_markup=get_main_menu())
+        await message.answer(f"✅ Напоминание на {dt_str} установлено!", reply_markup=get_main_menu())
     except Exception:
-        await message.answer("❌ Неверный формат. Напиши ровно так:\n`2026-10-30 18:00 Купить хлеб`", parse_mode="Markdown")
+        await message.answer("❌ Неверный формат. Напиши: `2026-10-30 18:00 Купить хлеб`", parse_mode="Markdown")
     await state.clear()
-
-@router.message(F.text == "🔍 Поиск в интернете")
-async def btn_search(message: Message, state: FSMContext):
-    await message.answer("Что найти в интернете?")
-    await state.set_state(BotStates.waiting_for_search)
-
-@router.message(BotStates.waiting_for_search)
-async def do_search(message: Message, state: FSMContext):
-    chat_id = await get_chat_id(message.from_user.id)
-    status = await message.answer(f"⏳ Ищу: {message.text}...")
-    res = await search_web(message.text)
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Поиск]: {message.text}\n[Результаты]: {res}"))
-        await db.commit()
-    await state.clear()
-    await ai_request(message, message.from_user.id, chat_id, status, extra=f"Результаты поиска по запросу '{message.text}':\n{res}")
 
 @router.message(F.text == "🎭 Сменить роль")
 async def btn_role(message: Message):
@@ -309,7 +343,7 @@ async def set_role(callback: CallbackQuery):
     await callback.message.edit_text(f"✅ Роль: **{role}**", parse_mode="Markdown")
     await callback.answer()
 
-# --- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА (С GitHub Деплоем) ---
+# --- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА (С GITHUB ДЕПЛОЕМ) ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -320,17 +354,15 @@ async def handle_text(message: Message):
     if url_match:
         content = await fetch_url(url_match.group(1))
         text = f"[Ссылка]: {content}\n\n[Вопрос]: {text.replace(url_match.group(1), '')}"
-        await status.edit_text("⏳ Прочитал сайт, думаю...")
+        await status.edit_text("⏳ Прочитал ссылку, думаю...")
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
         await db.commit()
 
-    # Проверяем, не просит ли он запушить в гитхаб
     if "github" in text.lower() or "загрузи" in text.lower() or "запушь" in text.lower():
         settings = await get_settings(message.from_user.id)
         if settings and settings[0] and settings[1]:
-            # Извлекаем код из последнего ответа нейросети
             async with aiosqlite.connect(DB_FILE) as db:
                 cursor = await db.execute("SELECT content FROM history WHERE chat_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1", (chat_id,))
                 row = await cursor.fetchone()
@@ -356,26 +388,6 @@ async def handle_text(message: Message):
                             return
 
     await ai_request(message, message.from_user.id, chat_id, status)
-
-# --- ФАЙЛЫ И ЮТУБ ---
-@router.message(F.document)
-async def handle_doc(message: Message):
-    chat_id = await get_chat_id(message.from_user.id)
-    status = await message.answer("⏳ Сохраняю файл...")
-    try:
-        b = await message.bot.download_file((await message.bot.get_file(message.document.file_id)).file_path)
-        raw = b.read()
-        text = ""
-        if message.document.file_name.endswith('.pdf'):
-            for p in PdfReader(io.BytesIO(raw)).pages[:20]: text += (p.extract_text() or "") + "\n"
-        else: text = raw.decode('utf-8')
-        
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute("INSERT INTO project_files (chat_id, filename, content) VALUES (?, ?, ?)", (chat_id, message.document.file_name, text))
-            await db.commit()
-        await status.edit_text(f"✅ Файл `{message.document.file_name}` сохранен в проект!", parse_mode="Markdown")
-    except Exception as e:
-        await status.edit_text(f"Ошибка: {e}")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
