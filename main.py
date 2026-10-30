@@ -35,6 +35,19 @@ DB_FILE = "bot_memory.db"
 if not BOT_TOKEN or not XEROSHARC_API_KEY:
     raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY!")
 
+# --- ДИАГНОСТИКА КЛЮЧА (СМОТРИ В ЛОГАХ BOTHOST) ---
+print("=======================================")
+print(f"🔑 BOT_TOKEN: {BOT_TOKEN[:10]}...")
+if XEROSHARC_API_KEY:
+    print(f"🔑 API_KEY начинается на: {XEROSHARC_API_KEY[:6]}...")
+    print(f"🔑 API_KEY заканчивается на: ...{XEROSHARC_API_KEY[-4:]}")
+    print(f"🔑 Длина ключа: {len(XEROSHARC_API_KEY)} символов")
+else:
+    print("❌ API_KEY ВООБЩЕ НЕ НАЙДЕН В ПЕРЕМЕННЫХ!")
+print(f"🌐 BASE_URL: {XEROSHARC_BASE_URL}")
+print("=======================================")
+# ---------------------------------------------------
+
 router = Router()
 client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=180.0, max_retries=0)
 
