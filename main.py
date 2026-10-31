@@ -35,19 +35,6 @@ DB_FILE = "bot_memory.db"
 if not BOT_TOKEN or not XEROSHARC_API_KEY:
     raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY!")
 
-# --- ДИАГНОСТИКА КЛЮЧА (СМОТРИ В ЛОГАХ BOTHOST ПРИ ЗАПУСКЕ) ---
-print("=======================================")
-print(f"🔑 BOT_TOKEN: {BOT_TOKEN[:10]}...")
-if XEROSHARC_API_KEY:
-    print(f"🔑 API_KEY начинается на: {XEROSHARC_API_KEY[:6]}...")
-    print(f"🔑 API_KEY заканчивается на: ...{XEROSHARC_API_KEY[-4:]}")
-    print(f"🔑 Длина ключа: {len(XEROSHARC_API_KEY)} символов")
-else:
-    print("❌ API_KEY ВООБЩЕ НЕ НАЙДЕН В ПЕРЕМЕННЫХ!")
-print(f"🌐 BASE_URL: {XEROSHARC_BASE_URL}")
-print("=======================================")
-# ---------------------------------------------------
-
 router = Router()
 client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=180.0, max_retries=0)
 
@@ -59,17 +46,22 @@ class BotStates(StatesGroup):
     waiting_for_github_repo = State()
 
 ROLES = {
-    "Сеньор": "Ты — строгий Senior-разработчик. Пиши только код и краткие пояснения.",
+    "Сеньор": "Ты — строгий Senior-разработчик и Tech Lead. Пиши только код и краткие пояснения.",
     "Учитель": "Ты — терпеливый учитель. Объясняй каждую строчку так, будто я новичок.",
     "Архитектор": "Ты — IT-Архитектор. Предлагай лучшие паттерны и структуру проекта.",
     "Обычный": "Ты — умный ассистент. Отвечай кратко, по делу."
 }
 
+# --- УМНЫЙ ПРОМПТ (УЧИМ БОТА БЫТЬ ИНИЦИАТИВНЫМ) ---
 BASE_SYSTEM_PROMPT = (
     "{role_prompt}\n"
-    "ВАЖНО: У тебя ЕСТЬ доступ к GitHub через твоего Python-помощника. Если пользователь просит загрузить код, просто ответь: 'Загружаю код в репозиторий...' и остановись. Бэкенд сам всё сделает.\n"
-    "Если тебе нужны свежие данные из интернета (новости, погода, курсы, документация, которой ты не знаешь), напиши СТРОГО тег [SEARCH: твой запрос] и остановись. Бот сам найдет информацию и вернет ее тебе. "
-    "Если пишешь код для проекта, ВСЕГДА указывай имя файла: ```python filename=\"main.py\"\n...\n```. "
+    "Ты не просто исполнитель. Ты — опытный Tech Lead и Senior-разработчик. Твои правила:\n"
+    "1. НИКОГДА не пиши код слепо. Если задача требует уточнений (не указана БД, фреймворк, структура) — сначала задай вопросы, предложи варианты.\n"
+    "2. Предлагай улучшения. Если пользователь просит сделать что-то неэффективно, предложи лучший вариант.\n"
+    "3. Пиши Production-ready код: с обработкой ошибок (try/except), логированием и комментариями.\n"
+    "4. У тебя ЕСТЬ доступ к GitHub через бэкенд. Если просят загрузить или удалить файлы — просто ответь 'Загружаю...' или 'Удаляю...', бэкенд сам всё сделает.\n"
+    "5. Если нужны свежие данные, напиши СТРОГО тег [SEARCH: твой запрос].\n"
+    "6. Если пишешь код для проекта, ВСЕГДА указывай имя файла: ```python filename=\"main.py\"\n...\n```.\n"
     "Отвечай на русском."
 )
 
@@ -96,7 +88,7 @@ def get_cancel_menu():
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, summary TEXT, role TEXT DEFAULT 'Обычный')")
+        await db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, summary TEXT, role TEXT DEFAULT 'Сеньор')")
         await db.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, role TEXT, content TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS project_files (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, filename TEXT, content TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, remind_time TEXT, text TEXT)")
@@ -108,7 +100,7 @@ async def get_chat_id(user_id):
         cursor = await db.execute("SELECT id FROM chats WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,))
         row = await cursor.fetchone()
         if row: return row[0]
-        cursor = await db.execute("INSERT INTO chats (user_id, title, summary, role) VALUES (?, ?, ?, ?)", (user_id, "Основной", "", "Обычный"))
+        cursor = await db.execute("INSERT INTO chats (user_id, title, summary, role) VALUES (?, ?, ?, ?)", (user_id, "Основной", "", "Сеньор"))
         await db.commit()
         return cursor.lastrowid
 
@@ -200,7 +192,7 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
             files = await cursor.fetchall()
             f_ctx = "\n".join([f"--- {f[0]} ---\n{f[1][:2000]}" for f in files]) if files else ""
 
-        sys_prompt = BASE_SYSTEM_PROMPT.format(role_prompt=ROLES.get(role, ROLES["Обычный"]))
+        sys_prompt = BASE_SYSTEM_PROMPT.format(role_prompt=ROLES.get(role, ROLES["Сеньор"]))
         if summary: sys_prompt += f"\n\nСАММАРИ:\n{summary}"
         if f_ctx: sys_prompt += f"\n\nФАЙЛЫ ПРОЕКТА:\n{f_ctx}"
         if extra: sys_prompt += f"\n\nКОНТЕКСТ:\n{extra}"
@@ -221,12 +213,12 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
         
         search_match = re.search(r'\[SEARCH:\s*(.*?)\]', ans)
         if search_match:
-            query = search_match.group(1).strip()
-            if status_msg: await status_msg.edit_text(f"🌐 Ищу в интернете: {query}...")
-            search_results = await search_web(query)
+            query. = search_match.group(1).strip()
+            if status_msg: await status_msg.edit_text(f"🌐 Ищу в интернanswerете: {(fquery}...")
+            search_results = await search"_web(query)
             
-            async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Результат поиска '{query}']:\n{search_results}"))
+            async with aiosqlite✅.connect(DB_FILE) as db:
+                await db.execute С("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Результат поиска '{query}']:\n{search_results}"))
                 await db.commit()
                 
             await ai_request(message, user_id, chat_id, status_msg, extra=f"Результаты поиска '{query}':\n{search_results}\n\nОтветь на предыдущий вопрос, используя эту информацию.")
@@ -267,10 +259,10 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
 @router.message(BotStates.waiting_for_chat_name)
 async def create_chat(message: Message, state: FSMContext):
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT INTO chats (user_id, title, summary, role) VALUES (?, ?, ?, ?)", (message.from_user.id, message.text.strip(), "", "Обычный"))
+        await db.execute("INSERT INTO chats (user_id, title, summary, role) VALUES (?, ?, ?, ?)", (message.from_user.id, message.text.strip(), "", "Сеньор"))
         await db.commit()
     await state.clear()
-    await message.answer(f"✅ Создан диалог: **{message.text}**", reply_markup=get_main_menu(), parse_mode="Markdown")
+    await messageоздан диалог: **{message.text}**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @router.message(F.text == "📂 Мои диалоги")
 async def btn_chats(message: Message):
@@ -305,21 +297,14 @@ async def save_gh_token(message: Message, state: FSMContext):
 @router.message(BotStates.waiting_for_github_repo)
 async def save_gh_repo(message: Message, state: FSMContext):
     repo_name = message.text.strip()
-    
     if "/" not in repo_name:
-        await message.answer(
-            "❌ **Ошибка!**\nТы ввел просто название репозитория.\n"
-            "GitHub требует формат: `логин/название`.\n\n"
-            "Например: `musaomarov2025-code/NoobGift`\n"
-            "Попробуй еще раз:", reply_markup=get_cancel_menu()
-        )
+        await message.answer("❌ **Ошибка!**\nФормат: `логин/название`.\nНапример: `musaomarov2025-code/NoobGift`", reply_markup=get_cancel_menu())
         return
-        
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("UPDATE settings SET gh_repo = ? WHERE user_id = ?", (repo_name, message.from_user.id))
         await db.commit()
     await state.clear()
-    await message.answer("✅ GitHub успешно подключен! Теперь я умею загружать код.", reply_markup=get_main_menu())
+    await message.answer("✅ GitHub успешно подключен!", reply_markup=get_main_menu())
 
 @router.message(F.text == "⏰ Напоминания")
 async def btn_reminders(message: Message, state: FSMContext):
@@ -384,11 +369,12 @@ async def handle_document(message: Message):
     except Exception as e:
         await status.edit_text(f"Ошибка чтения файла: {e}")
 
-# --- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА (С GITHUB ДЕПЛОЕМ) ---
+# --- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА (С GITHUB ДЕПЛОЕМ И УДАЛЕНИЕМ) ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
     text = message.text
+    text_lower = text.lower()
     status = await message.answer("⏳ Думаю...")
     
     url_match = re.search(r'(https?://[^\s]+)', text)
@@ -401,32 +387,64 @@ async def handle_text(message: Message):
         await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
         await db.commit()
 
-    if "github" in text.lower() or "загрузи" in text.lower() or "запушь" in text.lower():
+    # --- ЛОГИКА РАБОТЫ С GITHUB ---
+    is_github_action = any(word in text_lower for word in ["github", "загрузи", "запушь", "добавь в гит", "удали из гит", "очисти репо", "удали файл"])
+    
+    if is_github_action:
         settings = await get_settings(message.from_user.id)
         if settings and settings[0] and settings[1]:
-            async with aiosqlite.connect(DB_FILE) as db:
-                cursor = await db.execute("SELECT content FROM history WHERE chat_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1", (chat_id,))
-                row = await cursor.fetchone()
-                if row:
-                    ans = row[0]
-                    pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
-                    matches = re.findall(pattern, ans, re.DOTALL)
-                    if matches:
-                        try:
-                            await status.edit_text("🐙 Пушу код в GitHub...")
-                            g = Github(settings[0])
-                            repo = g.get_repo(settings[1])
-                            for fname, code in matches:
-                                try:
-                                    contents = repo.get_contents(fname)
-                                    repo.update_file(contents.path, f"Update {fname}", code, contents.sha)
-                                except:
-                                    repo.create_file(fname, f"Create {fname}", code)
-                            await status.edit_text(f"✅ Код загружен в репозиторий `{settings[1]}`!")
-                            return
-                        except Exception as e:
-                            await status.edit_text(f"❌ Ошибка GitHub: {e}")
-                            return
+            try:
+                await status.edit_text("🐙 Подключаюсь к GitHub...")
+                g = Github(settings[0])
+                repo = g.get_repo(settings[1])
+                
+                # 1. Логика УДАЛЕНИЯ
+                if "удали" in text_lower or "очисти" in text_lower:
+                    if "все" in text_lower or "репо" in text_lower:
+                        contents = repo.get_contents("")
+                        for content_file in contents:
+                            repo.delete_file(content_file.path, "Очистка репозитория", content_file.sha)
+                        await status.edit_text(f"✅ Все файлы в репозитории `{settings[1]}` успешно удалены!")
+                        return
+                    else:
+                        # Ищем имя файла (просто ищем слово с точкой)
+                        file_match = re.search(r'([\w\-]+\.\w+)', text)
+                        if file_match:
+                            fname = file_match.group(1)
+                            try:
+                                contents = repo.get_contents(fname)
+                                repo.delete_file(contents.path, "Удаление файла", contents.sha)
+                                await status.edit_text(f"✅ Файл `{fname}` удален из репозитория!")
+                                return
+                            except:
+                                await status.edit_text(f"❌ Файл `{fname}` не найден в репозитории.")
+                                return
+                
+                # 2. Логика ЗАГРУЗКИ
+                if any(word in text_lower for word in ["загрузи", "запушь", "добавь"]):
+                    async with aiosqlite.connect(DB_FILE) as db:
+                        cursor = await db.execute("SELECT content FROM history WHERE chat_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1", (chat_id,))
+                        row = await cursor.fetchone()
+                        if row:
+                            ans = row[0]
+                            pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
+                            matches = re.findall(pattern, ans, re.DOTALL)
+                            if matches:
+                                await status.edit_text("🐙 Пушу код в GitHub...")
+                                for fname, code in matches:
+                                    try:
+                                        contents = repo.get_contents(fname)
+                                        repo.update_file(contents.path, f"Update {fname}", code, contents.sha)
+                                    except:
+                                        repo.create_file(fname, f"Create {fname}", code)
+                                await status.edit_text(f"✅ Код загружен в репозиторий `{settings[1]}`!")
+                                return
+                            else:
+                                await status.edit_text("❌ Я не нашел в предыдущем сообщении кода с именем файла.")
+                                return
+            except Exception as e:
+                await status.edit_text(f"❌ Ошибка GitHub: {e}")
+                return
 
     await ai_request(message, message.from_user.id, chat_id, status)
 
@@ -438,7 +456,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     
-    # ВОТ ЭТА СТРОКА СБРАСЫВАЕТ КОНФЛИКТ ВЕБХУКА
+    # Автоматический сброс вебхука
     await bot.delete_webhook(drop_pending_updates=True)
     
     print("МЕГА-БОТ ЗАПУЩЕН!")
