@@ -20,13 +20,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 XEROSHARC_API_KEY = os.getenv("XEROSHARC_API_KEY")
 XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1")
 DB_FILE = "bot_memory.db"
 
+if not BOT_TOKEN or not XEROSHARC_API_KEY:
+    raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY!")
+
 router = Router()
-client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=40.0, max_retries=0)
+# Увеличили тайм-аут до 120 секунд, чтобы не рвать долгие ответы
+client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=120.0, max_retries=0)
 
 class BotStates(StatesGroup):
     waiting_for_chat_name = State()
@@ -54,6 +59,7 @@ async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_m
         if "message is not modified" not in str(e) and "message to edit not found" not in str(e):
             pass
 
+# --- КЛАВИАТУРЫ ---
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📂 Мои диалоги"), KeyboardButton(text="➕ Новый диалог")],
@@ -84,6 +90,7 @@ def get_chats_menu(chats):
 def get_cancel_menu():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]])
 
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, summary TEXT)")
@@ -152,6 +159,7 @@ async def summarize_chat_async(chat_id: int):
             except Exception:
                 pass 
 
+# --- НАПОМИНАНИЯ ---
 async def reminder_worker(bot: Bot):
     while True:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -165,6 +173,7 @@ async def reminder_worker(bot: Bot):
             await db.commit()
         await asyncio.sleep(30)
 
+# --- ЛОГИКА ИИ (ИСПРАВЛЕННЫЙ СТРИМИНГ) ---
 async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
@@ -179,7 +188,7 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     facts = await get_facts(user_id)
     sys_prompt = get_base_prompt()
     if summary: sys_prompt += f"\n\nСАММАРИ:\n{summary}"
-    if facts: sys_prompt += f"\n\nЧТО ТЫ ЗНАЕШЬ О ПОЛЬЗОВАТЕЛЕ:\n{facts}"
+    if facts: sys_prompt += f"\n\nФАКТЫ О ПОЛЬЗОВАТЕЛЕ:\n{facts}"
     
     msgs = [{"role": "system", "content": sys_prompt}] + history
     full_text = ""
@@ -197,13 +206,8 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 stream=True 
             )
             
-            last_chunk_time = asyncio.get_event_loop().time()
+            # Убрали жесткий таймер для каждого кусочка, ждем сколько нужно
             async for chunk in stream:
-                now = asyncio.get_event_loop().time()
-                if now - last_chunk_time > 8:
-                    raise asyncio.TimeoutError("Сервер завис")
-                last_chunk_time = now
-                
                 if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                     full_text += chunk.choices[0].delta.content
                     if len(full_text) % 30 == 0:
@@ -442,7 +446,6 @@ async def handle_text(message: Message):
             try:
                 res = await asyncio.to_thread(process_deletion)
                 await status.edit_text(res)
-                # СОХРАНЯЕМ В ИСТОРИЮ, ЧТОБЫ ИИ ЗНАЛ
                 async with aiosqlite.connect(DB_FILE) as db:
                     await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
                     await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", f"[СИСТЕМА: Я выполнил удаление. {res}]"))
@@ -466,7 +469,6 @@ async def handle_text(message: Message):
                     extra = "Репозиторий пуст."
                 await status.edit_text(res, parse_mode="Markdown")
                 
-                # Отправляем ИИ, чтобы он тоже знал контекст
                 async with aiosqlite.connect(DB_FILE) as db:
                     await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
                     await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", f"[СИСТЕМА: Я проверил GitHub. {extra}]"))
