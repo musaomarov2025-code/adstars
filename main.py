@@ -47,7 +47,8 @@ def get_base_prompt():
         "2. Если просят напомнить, пиши тег: [REMIND: YYYY-MM-DD HH:MM | текст].\n"
         "3. Если просят поискать в интернете: [SEARCH: запрос].\n"
         "4. АВТОПАМЯТЬ: Если пользователь сообщает важный факт о себе, напиши тег [MEMORIZE: факт].\n"
-        "5. Отвечай на русском."
+        "5. ВАЖНО: НИКОГДА не пиши код для удаления файлов из GitHub. Бэкенд делает это сам. Если просят удалить, просто скажи 'Удаляю...'.\n"
+        "6. Отвечай на русском."
     )
 
 async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_markup=None):
@@ -246,6 +247,7 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await ai_request_stream(message, user_id, chat_id)
                 return
 
+            # Сохраняем только те файлы, которые ИИ написал КАК КОД
             pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
             matches = re.findall(pattern, full_text, re.DOTALL)
             if matches:
@@ -262,7 +264,7 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
             if model == models_to_try[-1]:
                 try: await msg.delete()
                 except: pass
-                await message.answer("⚠️ **Сервера xerosharc сейчас лежат (Ошибка 503).**\nПодожди 5 минут.")
+                await message.answer("⚠️ **Сервера xerosharc сейчас лежат.**\nПодожди 5 минут.")
                 return
             else:
                 await safe_edit(msg, f"⏳ {model} перегружен. Пробую резервную...")
@@ -271,7 +273,7 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.\nВыбери модель или просто пиши задачу.", reply_markup=get_main_menu())
+    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.", reply_markup=get_main_menu())
 
 @router.message(F.text == "🤖 Выбрать модель")
 async def btn_models(message: Message):
@@ -392,7 +394,7 @@ async def cb_cancel_push(callback: CallbackQuery):
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await state.clear(); await callback.message.edit_text("❌ Отменено."); await callback.answer()
 
-# --- ОСНОВНОЙ ХЕНДЛЕР (С ЖЕСТКИМ ПЕРЕХВАТОМ УДАЛЕНИЯ) ---
+# --- ОСНОВНОЙ ХЕНДЛЕР (ЖЕСТКИЙ КОНТРОЛЬ GITHUB) ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -400,53 +402,81 @@ async def handle_text(message: Message):
     text_lower = text.lower()
     
     settings = await get_settings(message.from_user.id)
-
-    # --- 1. ЖЕСТКИЙ ПЕРЕХВАТ УДАЛЕНИЯ (БЕЗ ИИ) ---
+    
+    # --- 1. ЖЕСТКИЙ ПЕРЕХВАТ УДАЛЕНИЯ (ПИТОН, БЕЗ ИИ) ---
     if settings and settings[0] and settings[1]:
-        if any(word in text_lower for word in ["удали", "удалить", "сотри", "удали файл"]):
-            file_match = re.search(r'([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)', text)
-            if file_match:
-                fname = file_match.group(1)
-                status = await message.answer(f"🐙 Ищу и удаляю `{fname}`...", parse_mode="Markdown")
-                def delete_file():
+        if any(word in text_lower for word in ["удали", "удалить", "сотри", "очисти"]):
+            status = await message.answer("⏳ Работаю с GitHub...")
+            
+            def process_deletion():
+                g = Github(settings[0])
+                repo = g.get_repo(settings[1])
+                
+                if "все" in text_lower or "репо" in text_lower:
+                    def delete_recursive(content):
+                        count = 0
+                        if isinstance(content, list):
+                            for item in content: count += delete_recursive(item)
+                        else:
+                            if content.type == "dir": count += delete_recursive(repo.get_contents(content.path))
+                            else:
+                                repo.delete_file(content.path, "Очистка", content.sha)
+                                count += 1
+                        return count
+                    total = delete_recursive(repo.get_contents(""))
+                    return f"✅ Репозиторий полностью очищен! Удалено файлов: {total}."
+                
+                # Ищем имена файлов в тексте
+                file_matches = re.findall(r'([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)', text)
+                if not file_matches:
+                    return "❌ Не нашел имен файлов. Напиши точнее, например: 'Удали main.py'"
+                
+                deleted_count = 0
+                errors = []
+                for fname in file_matches:
                     try:
-                        g = Github(settings[0])
-                        repo = g.get_repo(settings[1])
                         contents = repo.get_contents(fname)
                         if isinstance(contents, list):
-                            return f"❌ `{fname}` — это папка. Я умею удалять только файлы."
-                        repo.delete_file(contents.path, f"Удаление {fname}", contents.sha)
-                        return f"✅ Файл `{fname}` успешно удален из GitHub!"
+                            errors.append(f"`{fname}` - это папка.")
+                        else:
+                            repo.delete_file(contents.path, f"Удаление {fname}", contents.sha)
+                            deleted_count += 1
                     except Exception as e:
-                        if "Not Found" in str(e):
-                            return f"❌ Файл `{fname}` не найден в репозитории."
-                        return f"❌ Ошибка: {e}"
-                res = await asyncio.to_thread(delete_file)
-                await status.edit_text(res)
-                return # СТОП. Нейросеть сюда не идет.
+                        errors.append(f"`{fname}`: {e}")
+                        
+                msg = ""
+                if deleted_count > 0: msg += f"✅ Успешно удалено файлов: {deleted_count}.\n"
+                if errors: msg += "❌ Ошибки:\n" + "\n".join(errors)
+                return msg if msg else "❌ Ничего не удалено."
 
-    # --- 2. ПЕРЕХВАТ ВОПРОСОВ ПРО ФАЙЛЫ GITHUB ---
-    extra_context = ""
-    if any(word in text_lower for word in ["github", "гитхаб", "файл", "репозитор"]):
-        if settings and settings[0] and settings[1]:
             try:
-                await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-                status = await message.answer("🔍 Смотрю файлы в репозитории...")
-                def get_files():
-                    g = Github(settings[0])
-                    repo = g.get_repo(settings[1])
-                    return [item.path for item in repo.get_contents("")]
+                res = await asyncio.to_thread(process_deletion)
+                await status.edit_text(res)
+            except Exception as e:
+                await status.edit_text(f"❌ Ошибка GitHub: {e}")
+            return # НЕ ПУСКАЕМ В ИИ
+
+        # --- 2. ПЕРЕХВАТ ВОПРОСОВ О ФАЙЛАХ (ПИТОН, БЕЗ ИИ) ---
+        if any(word in text_lower for word in ["какие файлы", "список файлов", "что в репо", "что в гитхаб"]):
+            status = await message.answer("⏳ Смотрю файлы в GitHub...")
+            def get_files():
+                g = Github(settings[0])
+                repo = g.get_repo(settings[1])
+                return [item.path for item in repo.get_contents("")]
+            try:
                 files = await asyncio.to_thread(get_files)
                 if files:
-                    extra_context = f"\n\n[СИСТЕМА: Ты подключен к репо '{settings[1]}'. Файлы: {', '.join(files)}. Ответь пользователю. НЕ ГОВОРИ что нет доступа]"
+                    res = "📁 **Файлы в корне репозитория:**\n" + "\n".join([f"- `{f}`" for f in files])
                 else:
-                    extra_context = f"\n\n[СИСТЕМА: Ты подключен к репо '{settings[1]}', но он пуст. Ответь пользователю.]"
-                await status.delete()
+                    res = "📁 Репозиторий пуст."
+                await status.edit_text(res, parse_mode="Markdown")
             except Exception as e:
-                extra_context = f"\n\n[СИСТЕМА: Ошибка чтения репо: {e}]"
+                await status.edit_text(f"❌ Ошибка: {e}")
+            return # НЕ ПУСКАЕМ В ИИ
 
+    # Если это не команды GitHub, идем к ИИ
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text + extra_context))
+        await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
         await db.commit()
         
     await ai_request_stream(message, message.from_user.id, chat_id)
