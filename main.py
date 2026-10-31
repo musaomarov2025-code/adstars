@@ -43,7 +43,7 @@ class BotStates(StatesGroup):
     waiting_for_github_token = State()
     waiting_for_github_repo = State()
 
-# --- КОНВЕРТАЦИЯ В HTML (ЧТОБЫ НЕ БЫЛО ЗВЕЗДОЧЕК) ---
+# --- КОНВЕРТАЦИЯ В HTML ---
 def convert_md_to_html(text):
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
@@ -51,7 +51,7 @@ def convert_md_to_html(text):
     text = re.sub(r'```(?:\w+)?\n(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
     return text
 
-# --- СИСТЕМНЫЙ ПРОМПТ (С РЕЖИМАМИ) ---
+# --- СИСТЕМНЫЙ ПРОМПТ ---
 def get_base_prompt(mode="Обычный"):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     prompts = {
@@ -70,7 +70,6 @@ def get_base_prompt(mode="Обычный"):
         "5. Отвечай на русском."
     )
 
-# --- БЕЗОПАСНАЯ ОТПРАВКА ---
 async def safe_edit(message: Message, text: str, reply_markup=None):
     try:
         await message.edit_text(convert_md_to_html(text), parse_mode="HTML", reply_markup=reply_markup)
@@ -86,7 +85,7 @@ async def safe_answer(message: Message, text: str, reply_markup=None):
     except Exception:
         await message.answer(text, reply_markup=reply_markup)
 
-# --- СИНХРОНИЗАЦИЯ БД С GITHUB ---
+# --- СИНХРОНИЗАЦИЯ БД ---
 async def restore_db_from_github():
     if not GH_TOKEN or not GH_REPO: return
     if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0: return
@@ -113,7 +112,7 @@ async def backup_db_to_github():
             await asyncio.to_thread(upload)
         except Exception: pass
 
-# --- БАЗА ДАННЫХ ---
+# --- БАЗА ДАННЫХ (С АВТО-МИГРАЦИЕЙ) ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, summary TEXT)")
@@ -124,6 +123,13 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, gh_token TEXT, gh_repo TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, selected_model TEXT DEFAULT 'claude-sonnet-4-6', mode TEXT DEFAULT 'Обычный')")
         await db.commit()
+
+        # Миграция для старых баз
+        try:
+            await db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT DEFAULT 'Обычный'")
+            await db.commit()
+        except Exception:
+            pass
 
 async def get_chat_id(user_id):
     async with aiosqlite.connect(DB_FILE) as db:
@@ -186,7 +192,6 @@ async def summarize_chat_async(chat_id: int):
                 await db.commit()
             except Exception: pass 
 
-# --- НАПОМИНАНИЯ ---
 async def reminder_worker(bot: Bot):
     while True:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -200,7 +205,6 @@ async def reminder_worker(bot: Bot):
             await db.commit()
         await asyncio.sleep(30)
 
-# --- ЗАПУСК КОДА (PISTON API) ---
 async def execute_code(code: str, lang: str):
     url = "https://emkc.org/api/v2/piston/execute"
     payload = {"language": lang, "version": "*", "files": [{"content": code}]}
@@ -213,7 +217,6 @@ async def execute_code(code: str, lang: str):
     except Exception as e:
         return f"Ошибка API: {e}"
 
-# --- ГЛАВНАЯ ЛОГИКА ИИ ---
 async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
@@ -257,7 +260,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", full_text))
                 await db.commit()
 
-            # --- ОБРАБОТКА ТЕГОВ ---
             remind_match = re.search(r'\[REMIND:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|\s*(.*?)\]', full_text)
             if remind_match:
                 dt_str, rem_text = remind_match.groups()
@@ -291,14 +293,12 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await message.answer_document(document=file_to_send, caption=f"📄 Документ `{fname}` готов!")
                 return
 
-            # Кнопки управления
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Заново", callback_data="regen_text"),
                  InlineKeyboardButton(text="➡️ Продолжить", callback_data="continue_text")]
             ])
             await message.answer("👇", reply_markup=kb)
 
-            # Проверка на код
             pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
             matches = re.findall(pattern, full_text, re.DOTALL)
             if matches:
@@ -342,11 +342,10 @@ def get_models_menu():
         [InlineKeyboardButton(text="GPT-6.1 Sol", callback_data="set_model_gpt-6.1-sol")]
     ])
 
-# --- ХЕНДЛЕРЫ КОМАНД ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой ТОП ИИ-ассистент.\nТеперь я понимаю голос, делаю документы и запускаю код!", reply_markup=get_main_menu())
+    await message.answer("👋 Привет! Я твой ТОП ИИ-ассистент.", reply_markup=get_main_menu())
 
 @router.message(F.text == "🎭 Режимы")
 async def btn_modes(message: Message):
@@ -379,7 +378,7 @@ async def cb_set_model(callback: CallbackQuery):
 async def btn_facts(message: Message):
     facts = await get_facts(message.from_user.id)
     if facts: await message.answer(f"📋 **Мои знания о тебе:**\n\n{facts}", parse_mode="Markdown")
-    else: await message.answer("Я пока ничего о тебе не знаю. Напиши 'Запомни, что...' чтобы я запомнил.")
+    else: await message.answer("Я пока ничего о тебе не знаю.")
 
 @router.message(F.text == "🧹 Очистить чат")
 async def btn_clear(message: Message):
@@ -422,7 +421,6 @@ async def switch_chat(callback: CallbackQuery):
     except: pass
     await callback.answer()
 
-# --- GITHUB ---
 @router.message(F.text == "🐙 GitHub")
 async def btn_github(message: Message, state: FSMContext):
     settings = await get_settings(message.from_user.id)
@@ -478,7 +476,6 @@ async def cb_push_github(callback: CallbackQuery):
             await db.commit()
     except Exception as e: await callback.message.edit_text(f"❌ {e}")
 
-# --- ГОЛОСОВЫЕ ---
 @router.message(F.voice)
 async def handle_voice(message: Message):
     status_msg = await message.answer("🎙 Слушаю голосовое...")
@@ -500,7 +497,6 @@ async def handle_voice(message: Message):
     except Exception as e:
         await status_msg.edit_text(f"⚠️ Ошибка распознавания (прокси не поддерживает Whisper):\n{e}")
 
-# --- ЗАПУСК КОДА ---
 @router.callback_query(F.data == "exec_py")
 async def cb_exec_code(callback: CallbackQuery):
     chat_id = await get_chat_id(callback.from_user.id)
@@ -512,7 +508,6 @@ async def cb_exec_code(callback: CallbackQuery):
     result = await execute_code(row[0], "python")
     await callback.message.answer(f"▶️ **Результат:**\n<pre>{result}</pre>", parse_mode="HTML")
 
-# --- КНОПКИ ПЕРЕГЕНЕРАЦИИ ---
 @router.callback_query(F.data == "regen_text")
 async def cb_regen(callback: CallbackQuery):
     chat_id = await get_chat_id(callback.from_user.id)
@@ -534,7 +529,6 @@ async def cb_continue(callback: CallbackQuery):
     await callback.message.delete()
     await ai_request_stream(callback.message, callback.from_user.id, chat_id)
 
-# --- ФОТО И ДОКУМЕНТЫ ---
 @router.message(F.photo)
 async def handle_photo(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -599,7 +593,6 @@ async def handle_document(message: Message):
         await status_msg.delete()
         await message.answer(f"⚠️ Ошибка при чтении файла: {e}")
 
-# --- ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -616,7 +609,6 @@ async def handle_text(message: Message):
     settings = await get_settings(message.from_user.id)
     
     if settings and settings[0] and settings[1]:
-        # ПЕРЕХВАТ ФАЙЛОВ / GITHUB
         if re.search(r'(файл|репо|гит|шит|пусто|github|гитхаб)', text_lower):
             status = await message.answer("⏳ Смотрю файлы в GitHub...")
             def get_files():
