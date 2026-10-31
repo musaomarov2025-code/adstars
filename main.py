@@ -35,7 +35,7 @@ DB_FILE = "bot_memory.db"
 if not BOT_TOKEN or not XEROSHARC_API_KEY:
     raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY!")
 
-# --- ДИАГНОСТИКА КЛЮЧА (СМОТРИ В ЛОГАХ BOTHOST) ---
+# --- ДИАГНОСТИКА КЛЮЧА (СМОТРИ В ЛОГАХ BOTHOST ПРИ ЗАПУСКЕ) ---
 print("=======================================")
 print(f"🔑 BOT_TOKEN: {BOT_TOKEN[:10]}...")
 if XEROSHARC_API_KEY:
@@ -356,6 +356,34 @@ async def set_role(callback: CallbackQuery):
     await callback.message.edit_text(f"✅ Роль: **{role}**", parse_mode="Markdown")
     await callback.answer()
 
+# --- ФАЙЛЫ (ЧТЕНИЕ ДОКУМЕНТОВ) ---
+@router.message(F.document)
+async def handle_document(message: Message):
+    chat_id = await get_chat_id(message.from_user.id)
+    if message.document.file_size > 20 * 1024 * 1024:
+        await message.answer("Файл слишком большой (макс 20 МБ).")
+        return
+    status = await message.answer("⏳ Читаю файл...")
+    try:
+        file_bytes = await message.bot.download_file((await message.bot.get_file(message.document.file_id)).file_path)
+        raw_data = file_bytes.read()
+        extracted_text = ""
+        
+        if message.document.file_name.lower().endswith('.pdf'):
+            reader = PdfReader(io.BytesIO(raw_data))
+            for page in reader.pages[:20]: 
+                extracted_text += (page.extract_text() or "") + "\n"
+        else:
+            extracted_text = raw_data.decode('utf-8')
+
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("INSERT INTO project_files (chat_id, filename, content) VALUES (?, ?, ?)", (chat_id, message.document.file_name, extracted_text))
+            await db.commit()
+            
+        await status.edit_text(f"✅ Файл `{message.document.file_name}` сохранен в проект!", parse_mode="Markdown")
+    except Exception as e:
+        await status.edit_text(f"Ошибка чтения файла: {e}")
+
 # --- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА (С GITHUB ДЕПЛОЕМ) ---
 @router.message(F.text)
 async def handle_text(message: Message):
@@ -409,6 +437,10 @@ async def main():
     asyncio.create_task(reminder_worker(bot))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    
+    # ВОТ ЭТА СТРОКА СБРАСЫВАЕТ КОНФЛИКТ ВЕБХУКА
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     print("МЕГА-БОТ ЗАПУЩЕН!")
     await dp.start_polling(bot)
 
