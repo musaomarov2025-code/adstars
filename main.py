@@ -131,7 +131,6 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, selected_model TEXT DEFAULT 'claude-sonnet-4-6', mode TEXT DEFAULT 'Обычный', auto_push INTEGER DEFAULT 0)")
         await db.commit()
 
-        # Миграции для старых баз
         try: await db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT DEFAULT 'Обычный'")
         except: pass
         try: await db.execute("ALTER TABLE user_settings ADD COLUMN auto_push INTEGER DEFAULT 0")
@@ -270,7 +269,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", full_text))
                 await db.commit()
 
-            # ТЕГИ
             remind_match = re.search(r'\[REMIND:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|\s*(.*?)\]', full_text)
             if remind_match:
                 dt_str, rem_text = remind_match.groups()
@@ -304,7 +302,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await message.answer_document(document=file_to_send, caption=f"📄 Документ `{fname}` готов!")
                 return
 
-            # ОТПРАВКА КОДА
             pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
             matches = re.findall(pattern, full_text, re.DOTALL)
             if matches:
@@ -313,14 +310,12 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                         await db.execute("INSERT INTO project_files (chat_id, filename, content) VALUES (?, ?, ?)", (chat_id, fname, code))
                     await db.commit()
 
-                # Отправляем файлы
                 for fname, code in matches:
                     file_to_send = BufferedInputFile(code.encode('utf-8'), filename=fname)
                     await message.answer_document(document=file_to_send, caption=f"📄 Файл `{fname}`")
 
                 settings = await get_settings(user_id)
                 if settings and settings[0] and settings[1] and auto_push == 1:
-                    # АВТО-ПУШ
                     await message.answer("🐙 Авто-обновление кода в GitHub...")
                     def auto_push_func():
                         g = Github(settings[0]); repo = g.get_repo(settings[1])
@@ -335,7 +330,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                     except Exception as e:
                         await message.answer(f"❌ Ошибка авто-пуша: {e}")
                 else:
-                    # Кнопки, если автопуш выключен
                     kb_code = InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text="✅ Загрузить в GitHub", callback_data="do_push_github")],
                         [InlineKeyboardButton(text="▶️ Запустить код (Python)", callback_data="exec_py")]
@@ -451,19 +445,14 @@ async def switch_chat(callback: CallbackQuery):
     except: pass
     await callback.answer()
 
-# --- GITHUB МЕНЮ С АВТО-РЕЖИМОМ ---
 @router.message(F.text == "🐙 GitHub")
 async def btn_github(message: Message, state: FSMContext):
     settings = await get_settings(message.from_user.id)
     if settings and settings[0] and settings[1]:
         _, _, auto_push = await get_user_data(message.from_user.id)
         status_text = "🟢 ВКЛЮЧЕН (код летит в GitHub сам)" if auto_push else "🔴 ВЫКЛЮЧЕН (нужно нажимать кнопку)"
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Переключить Авто-режим", callback_data="toggle_auto_push")]
-        ])
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Переключить Авто-режим", callback_data="toggle_auto_push")]])
         await message.answer(f"✅ GitHub подключен: `{settings[1]}`\n\nАвто-режим: **{status_text}**", reply_markup=kb, parse_mode="Markdown")
-        
         chat_id = await get_chat_id(message.from_user.id)
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", f"[СИСТЕМА: GitHub подключен. Репозиторий: {settings[1]}]"))
@@ -499,7 +488,6 @@ async def save_gh_repo(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ GitHub подключен!", reply_markup=get_main_menu())
 
-# --- ОСТАЛЬНЫЕ КНОПКИ ---
 @router.callback_query(F.data == "do_push_github")
 async def cb_push_github(callback: CallbackQuery):
     chat_id = await get_chat_id(callback.from_user.id)
@@ -535,7 +523,6 @@ async def cb_exec_code(callback: CallbackQuery):
     result = await execute_code(row[0], "python")
     await callback.message.answer(f"▶️ **Результат:**\n<pre>{result}</pre>", parse_mode="HTML")
 
-# --- ОСТАЛЬНЫЕ ХЕНДЛЕРЫ ---
 @router.message(F.voice)
 async def handle_voice(message: Message):
     status_msg = await message.answer("🎙 Слушаю голосовое...")
@@ -634,21 +621,57 @@ async def handle_text(message: Message):
             await message.answer(f"🧠 Запомнил: <i>{fact}</i>", parse_mode="HTML")
             return
 
+    # --- АВТО-ПОИСК В ИНТЕРНЕТЕ ---
+    search_triggers = ["новост", "погод", "курс", "цена", "что такое", "кто такой", "как сделать", "почему", "когда"]
+    if "?" in text or any(w in text_lower for w in search_triggers):
+        if not any(w in text_lower for w in ["привет", "как дела", "ты тут"]):
+            status = await message.answer("🌐 Ищу актуальную информацию в сети...")
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(f"https://s.jina.ai/{text}", timeout=30) as r:
+                        if r.status == 200:
+                            search_res = (await r.text())[:8000]
+                            text = f"[ДАННЫЕ ИЗ ИНТЕРНЕТА ПО ЗАПРОСУ '{text}']:\n{search_res}\n\n[ВОПРОС ПОЛЬЗОВАТЕЛЯ]: {text}"
+                        else:
+                            await status.delete()
+            except Exception:
+                await status.delete()
+            finally:
+                try: await status.delete()
+                except: pass
+    # ------------------------------
+
     settings = await get_settings(message.from_user.id)
     
     if settings and settings[0] and settings[1]:
-        # 1. ПРОВЕРКА ПРОЕКТА
+        # СКАЧИВАНИЕ ФАЙЛА
+        file_match = re.search(r'(скинь|достань|пришли|покажи|дай).*?([a-zA-Z0-9_\-]+\.(?:py|txt|json|md|sh|db))', text_lower)
+        if file_match:
+            fname = file_match.group(2)
+            status = await message.answer(f"⏳ Ищу `{fname}` в GitHub...", parse_mode="Markdown")
+            def get_file():
+                g = Github(settings[0]); repo = g.get_repo(settings[1])
+                try: return repo.get_contents(fname).decoded_content.decode('utf-8')
+                except: return None
+            try:
+                file_content = await asyncio.to_thread(get_file)
+                if file_content:
+                    await status.delete()
+                    file_to_send = BufferedInputFile(file_content.encode('utf-8'), filename=fname)
+                    await message.answer_document(document=file_to_send, caption=f"📄 Вот твой файл `{fname}`")
+                else: await status.edit_text(f"❌ Файл `{fname}` не найден.")
+            except Exception as e: await status.edit_text(f"❌ Ошибка: {e}")
+            return
+
+        # АНАЛИЗ ПРОЕКТА
         if re.search(r'(проверь|посмотри|какие файлы|что в|покажи|список)', text_lower) and re.search(r'(проект|код|репо|гит|файл)', text_lower):
             status = await message.answer("⏳ Скачиваю файлы из GitHub для анализа...")
             def get_files_info():
                 g = Github(settings[0]); repo = g.get_repo(settings[1])
                 files_info = []
-                contents = repo.get_contents("")
-                for item in contents:
+                for item in repo.get_contents(""):
                     if item.type == "file":
-                        try:
-                            file_content = item.decoded_content.decode('utf-8')[:10000]
-                            files_info.append(f"--- Файл: {item.name} ---\n{file_content}\n")
+                        try: files_info.append(f"--- Файл: {item.name} ---\n{item.decoded_content.decode('utf-8')[:10000]}\n")
                         except: pass
                     else: files_info.append(f"--- Папка: {item.name} ---")
                 return "\n".join(files_info)
@@ -656,32 +679,31 @@ async def handle_text(message: Message):
                 files_data = await asyncio.to_thread(get_files_info)
                 await status.edit_text("🧠 Изучаю код проекта...")
                 async with aiosqlite.connect(DB_FILE) as db:
-                    prompt = f"Пользователь просит проверить проект. Вот содержимое его репозитория:\n{files_data}\n\nПроанализируй код, найди ошибки и предложи улучшения."
+                    prompt = f"Пользователь просит проверить проект. Вот содержимое:\n{files_data}\n\nПроанализируй код."
                     await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", prompt))
                     await db.commit()
                 await ai_request_stream(message, message.from_user.id, chat_id)
-            except Exception as e: await status.edit_text(f"❌ Ошибка при чтении репозитория: {e}")
+            except Exception as e: await status.edit_text(f"❌ Ошибка: {e}")
             return
 
-        # 2. СПИСОК ФАЙЛОВ
-        if re.search(r'(файл|репо|гит|шит|пусто|github|гитхаб)', text_lower):
+        # СПИСОК ФАЙЛОВ =
+        if re.search(r'(файл|репо|гит|шит|пусто|github|гитхаб)', text_lower) and not "скинь" in text_lower:
             status = await message.answer("⏳ Смотрю файлы в GitHub...")
             def get_files():
-                g = Github(settings[0]); repo = g.get_repo(settings[1])
+                g Github(settings[0]); repo = g.get_repo(settings[1])
                 return [item.path for item in repo.get_contents("")]
             try:
                 files = await asyncio.to_thread(get_files)
-                if files: res = f"📁 **В репозитории `{settings[1]}`:**\n" + "\n".join([f"- `{f}`" for f in files])
-                else: res = f"📁 **Репозиторий `{settings[1]}` пуст.**"
+                res = f"📁 **В репозитории `{settings[1]}`:**\n" + "\n".join([f"- `{f}`" for f in files]) if files else f"📁 **Репозиторий пуст.**"
                 await status.edit_text(res, parse_mode="Markdown")
                 async with aiosqlite.connect(DB_FILE) as db:
                     await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
-                    await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", f"[СИСТЕМА: Я проверил GitHub. {res}]"))
+                    await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", f"[СИСТЕМА: {res}]"))
                     await db.commit()
-            except Exception as e: await status.edit_text(f"❌ Ошибка GitHub: {e}")
+            except Exception as e: await status.edit_text(f"❌ Ошибка: {e}")
             return 
 
-        # 3. УДАЛЕНИЕ
+        # УДАЛЕНИЕ
         if any(word in text_lower for word in ["удали", "удалить", "сотри", "очисти"]):
             status = await message.answer("⏳ Работаю с GitHub...")
             def process_deletion():
