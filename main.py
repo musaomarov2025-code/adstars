@@ -50,7 +50,6 @@ def get_base_prompt():
         "5. Отвечай на русском."
     )
 
-# --- БЕЗОПАСНОЕ РЕДАКТИРОВАНИЕ ---
 async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_markup=None):
     try:
         await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -62,9 +61,18 @@ async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_m
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📂 Мои диалоги"), KeyboardButton(text="➕ Новый диалог")],
-        [KeyboardButton(text="🧠 Что ты обо мне знаешь?"), KeyboardButton(text="🐙 GitHub Деплой")],
-        [KeyboardButton(text="🧹 Очистить чат"), KeyboardButton(text="❓ Помощь")]
+        [KeyboardButton(text="🤖 Выбрать модель"), KeyboardButton(text="🐙 GitHub Деплой")],
+        [KeyboardButton(text="🧠 Что ты обо мне знаешь?"), KeyboardButton(text="🧹 Очистить чат")],
+        [KeyboardButton(text="❓ Помощь")]
     ], resize_keyboard=True)
+
+def get_models_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Claude Opus 5.5 (Самая умная)", callback_data="set_model_claude-opus-5-5")],
+        [InlineKeyboardButton(text="Claude Sonnet 4.6 (Средняя)", callback_data="set_model_claude-sonnet-4-6")],
+        [InlineKeyboardButton(text="Claude Haiku 4.5 (Быстрая)", callback_data="set_model_claude-haiku-4-5")],
+        [InlineKeyboardButton(text="GPT-6.1 Sol (Альтернатива)", callback_data="set_model_gpt-6.1-sol")]
+    ])
 
 def get_github_action_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -89,6 +97,8 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, remind_time TEXT, text TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, fact_text TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, gh_token TEXT, gh_repo TEXT)")
+        # Новая таблица для хранения выбранной модели
+        await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, selected_model TEXT DEFAULT 'claude-sonnet-4-6')")
         await db.commit()
 
 async def get_chat_id(user_id):
@@ -110,6 +120,12 @@ async def get_facts(user_id):
         cursor = await db.execute("SELECT fact_text FROM facts WHERE user_id = ?", (user_id,))
         rows = await cursor.fetchall()
         return "\n".join([f"- {r[0]}" for r in rows]) if rows else ""
+
+async def get_user_model(user_id):
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT selected_model FROM user_settings WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else "claude-sonnet-4-6"
 
 # --- СЖАТИЕ ПАМЯТИ ---
 async def summarize_chat_async(chat_id: int):
@@ -152,9 +168,10 @@ async def reminder_worker(bot: Bot):
             await db.commit()
         await asyncio.sleep(30)
 
-# --- ЛОГИКА ИИ (С ПЕРЕКЛЮЧЕНИЕМ МОДЕЛЕЙ) ---
+# --- ЛОГИКА ИИ (С УЧЕТОМ ВЫБРАННОЙ МОДЕЛИ) ---
 async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
         row = await cursor.fetchone()
@@ -171,7 +188,9 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     full_text = ""
     msg = await message.answer("⏳ Думаю...")
     
-    models_to_try = ["claude-sonnet-4-6", "gpt-6.1-sol"]
+    user_model = await get_user_model(user_id)
+    # Ставим выбранную пользователем модель первой, а остальные как резерв
+    models_to_try = list(dict.fromkeys([user_model, "claude-sonnet-4-6", "gpt-6.1-sol"]))
     
     for model in models_to_try:
         try:
@@ -248,13 +267,28 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await message.answer("⚠️ **Все сервера xerosharc сейчас лежат (Ошибка 503).**\nПожалуйста, подожди 5-10 минут.")
                 return
             else:
-                await safe_edit(msg, f"⏳ {model} перегружен. Пробую резервную модель...")
+                await safe_edit(msg, f"⏳ {model} перегружен. Пробую резервную...")
 
-# --- ВСЕ ХЕНДЛЕРЫ КНОПОК ---
+# --- ВСЕ ХЕНДЛЕРЫ ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.\nОбщайся со мной свободно.", reply_markup=get_main_menu())
+    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.\nВыбери модель в меню или просто пиши задачу.", reply_markup=get_main_menu())
+
+@router.message(F.text == "🤖 Выбрать модель")
+async def btn_models(message: Message):
+    current = await get_user_model(message.from_user.id)
+    await message.answer(f"Текущая модель: `{current}`\n\nВыбери новую:", reply_markup=get_models_menu(), parse_mode="Markdown")
+
+@router.callback_query(F.data.startswith("set_model_"))
+async def cb_set_model(callback: CallbackQuery):
+    new_model = callback.data.replace("set_model_", "")
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT OR IGNORE INTO user_settings (user_id, selected_model) VALUES (?, ?)", (callback.from_user.id, new_model))
+        await db.execute("UPDATE user_settings SET selected_model = ? WHERE user_id = ?", (new_model, callback.from_user.id))
+        await db.commit()
+    await callback.message.edit_text(f"✅ Модель изменена на `{new_model}`!\nТеперь все запросы будут идти через неё.", parse_mode="Markdown")
+    await callback.answer()
 
 @router.message(F.text == "📂 Мои диалоги")
 async def btn_chats(message: Message):
@@ -302,7 +336,6 @@ async def btn_clear(message: Message):
 async def btn_help(message: Message):
     await message.answer("Просто пиши мне задачи! Я помню контекст, могу искать в интернете и загружать код на GitHub.")
 
-# --- GITHUB ---
 @router.message(F.text == "🐙 GitHub Деплой")
 async def btn_github(message: Message, state: FSMContext):
     settings = await get_settings(message.from_user.id)
@@ -361,14 +394,47 @@ async def cb_cancel_push(callback: CallbackQuery):
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await state.clear(); await callback.message.edit_text("❌ Отменено."); await callback.answer()
 
-# --- ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР ---
+# --- ОСНОВНОЙ ХЕНДЛЕР (С ПЕРЕХВАТОМ ФАЙЛОВ GITHUB) ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
     text = message.text
+    text_lower = text.lower()
+    
+    extra_context = ""
+    
+    # Перехват вопросов про GitHub
+    if "github" in text_lower or "гитхаб" in text_lower or "файл" in text_lower or "репозитор" in text_lower:
+        settings = await get_settings(message.from_user.id)
+        if settings and settings[0] and settings[1]:
+            try:
+                await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+                status = await message.answer("🔍 Смотрю файлы в твоем репозитории...")
+                
+                def get_files():
+                    g = Github(settings[0])
+                    repo = g.get_repo(settings[1])
+                    contents = repo.get_contents("")
+                    files_list = []
+                    for item in contents:
+                        files_list.append(item.path)
+                    return files_list
+                
+                files = await asyncio.to_thread(get_files)
+                
+                if files:
+                    extra_context = f"\n\n[СИСТЕМНАЯ ИНФОРМАЦИЯ: Пользователь спрашивает про GitHub. Ты УЖЕ подключен к его репозиторию '{settings[1]}'. Вот список файлов, которые сейчас есть в корне репозитория: {', '.join(files)}. Ответь на его вопрос, используя этот список. НЕ ГОВОРИ, что у тебя нет доступа.]"
+                else:
+                    extra_context = f"\n\n[СИСТЕМНАЯ ИНФОРМАЦИЯ: Пользователь спрашивает про GitHub. Ты подключен к репозиторию '{settings[1]}', но он ПУСТ. Нет ни одного файла. Ответь пользователю.]"
+                
+                await status.delete()
+            except Exception as e:
+                extra_context = f"\n\n[СИСТЕМНАЯ ИНФОРМАЦИЯ: Пользователь спрашивает про GitHub. Ошибка чтения репозитория: {e}]"
+
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
+        await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text + extra_context))
         await db.commit()
+        
     await ai_request_stream(message, message.from_user.id, chat_id)
 
 async def main():
@@ -379,7 +445,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("БОТ ЗАПУЩЕН!")
+    print("БОТ ЗАПУЩЕН (С ВЫБОРОМ МОДЕЛЕЙ)!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
