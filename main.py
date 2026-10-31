@@ -1,21 +1,15 @@
 import asyncio
-import base64
-import io
 import logging
 import os
 import re
-import zipfile
 import aiohttp
 import aiosqlite
 import datetime
-from bs4 import BeautifulSoup
-from pypdf import PdfReader
 from github import Github
-
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton, 
+    Message, ReplyKeyboardMarkup, KeyboardButton, 
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from aiogram.fsm.context import FSMContext
@@ -26,17 +20,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 XEROSHARC_API_KEY = os.getenv("XEROSHARC_API_KEY")
 XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1")
 DB_FILE = "bot_memory.db"
 
-if not BOT_TOKEN or not XEROSHARC_API_KEY:
-    raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY!")
-
 router = Router()
-client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=180.0, max_retries=0)
+# Ставим жесткий тайм-аут 60 секунд, чтобы бот не висел вечно
+client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=60.0, max_retries=0)
 
 class BotStates(StatesGroup):
     waiting_for_chat_name = State()
@@ -118,30 +109,22 @@ async def summarize_chat_async(chat_id: int):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT count(*) FROM history WHERE chat_id = ?", (chat_id,))
         count = (await cursor.fetchone())[0]
-        
         if count > 50:
             cursor = await db.execute("SELECT id, role, content FROM history WHERE chat_id = ? ORDER BY id ASC LIMIT 20", (chat_id,))
             old_msgs = await cursor.fetchall()
             text = "\n".join([f"{m[1]}: {m[2]}" for m in old_msgs])
-            
             try:
                 resp = await client.chat.completions.create(
                     model="claude-haiku-4-5", 
-                    messages=[{"role": "user", "content": f"Сожми этот диалог в саммари (сохрани суть и код):\n{text}"}],
+                    messages=[{"role": "user", "content": f"Сожми диалог в саммари:\n{text}"}],
                     max_tokens=1000
                 )
-                # ЗАЩИТА ОТ ПУСТОГО ОТВЕТА
-                if not resp.choices:
-                    return
+                if not resp.choices: return
                 new_summary = resp.choices[0].message.content
-                
                 cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
                 row = await cursor.fetchone()
                 old_summary = row[0] if row and row[0] else ""
-                combined = old_summary + "\n" + new_summary
-                
-                await db.execute("UPDATE chats SET summary = ? WHERE id = ?", (combined[:4000], chat_id))
-                
+                await db.execute("UPDATE chats SET summary = ? WHERE id = ?", ((old_summary + "\n" + new_summary)[:4000], chat_id))
                 ids = [str(m[0]) for m in old_msgs]
                 await db.execute(f"DELETE FROM history WHERE id IN ({','.join(ids)})")
                 await db.commit()
@@ -163,23 +146,20 @@ async def reminder_worker(bot: Bot):
 
 async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
         row = await cursor.fetchone()
         summary = row[0] if row and row[0] else ""
-        
         cursor = await db.execute("SELECT role, content FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 50", (chat_id,))
         history = [{"role": r[0], "content": r[1]} for r in reversed(await cursor.fetchall())]
         
     facts = await get_facts(user_id)
     sys_prompt = get_base_prompt()
-    if summary: sys_prompt += f"\n\nКРАТКОЕ СОДЕРЖАНИЕ СТАРОГО ДИАЛОГА:\n{summary}"
-    if facts: sys_prompt += f"\n\nЧТО ТЫ ЗНАЕШЬ О ПОЛЬЗОВАТЕЛЕ:\n{facts}"
+    if summary: sys_prompt += f"\n\nСАММАРИ:\n{summary}"
+    if facts: sys_prompt += f"\n\nФАКТЫ О ПОЛЬЗОВАТЕЛЕ:\n{facts}"
     
     msgs = [{"role": "system", "content": sys_prompt}] + history
     full_text = ""
-    
     msg = await message.answer("⏳ Думаю...")
     
     try:
@@ -191,7 +171,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
         )
         
         async for chunk in stream:
-            # ГЛАВНАЯ ЗАЩИТА ОТ ОШИБКИ list index out of range
             if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                 full_text += chunk.choices[0].delta.content
                 if len(full_text) % 30 == 0:
@@ -199,13 +178,12 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                     await safe_edit(msg, display_text + " █") 
                     
         display_text = re.sub(r'\[(REMIND|SEARCH|MEMORIZE).*?\]', '', full_text).strip()
-        await safe_edit(msg, display_text)
+        await safe_edit(msg, display_text if display_text else "Готово.")
         
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", full_text))
             await db.commit()
 
-        # --- ТЕГИ ---
         memorize_matches = re.findall(r'\[MEMORIZE:\s*(.*?)\]', full_text)
         for fact in memorize_matches:
             async with aiosqlite.connect(DB_FILE) as db:
@@ -228,7 +206,7 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 async with s.get(f"https://s.jina.ai/{query}", timeout=60) as r:
                     res = (await r.text())[:20000]
             async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Результат поиска '{query}']:\n{res}"))
+                await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Поиск '{query}']:\n{res}"))
                 await db.commit()
             await ai_request_stream(message, user_id, chat_id)
             return
@@ -245,12 +223,47 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
         asyncio.create_task(summarize_chat_async(chat_id))
 
     except Exception as e:
-        await safe_edit(msg, f"⚠️ Ошибка: {e}")
+        logging.error(f"Ошибка стриминга: {e}")
+        # Если ошибка, удаляем "Думаю..." и пишем об ошибке
+        try: await msg.delete()
+        except: pass
+        await message.answer(f"⚠️ Ошибка API (скорее всего перегрузка xerosharc):\n`{e}`", parse_mode="Markdown")
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
     await message.answer("👋 Привет! Я твой умный ИИ-ассистент.", reply_markup=get_main_menu())
+
+# --- ВОЗВРАЩАЕМ ВСЕ КНОПКИ НА МЕСТО ---
+@router.message(F.text == "📂 Мои диалоги")
+async def btn_chats(message: Message):
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT id, title FROM chats WHERE user_id = ? ORDER BY id DESC", (message.from_user.id,))
+        chats = await cursor.fetchall()
+    await message.answer("Выбери диалог:", reply_markup=get_chats_menu(chats))
+
+@router.callback_query(F.data.startswith("switch_"))
+async def switch_chat(callback: CallbackQuery):
+    try: await callback.message.edit_text("✅ Диалог выбран. Пиши задачу.")
+    except: pass
+    await callback.answer()
+
+@router.message(F.text == "❓ Помощь")
+async def btn_help(message: Message):
+    await message.answer("Просто пиши мне задачи! Я помню контекст, могу искать в интернете и загружать код на GitHub.")
+
+@router.message(F.text == "➕ Новый диалог")
+async def btn_new_chat(message: Message, state: FSMContext):
+    await message.answer("Название нового диалога:", reply_markup=get_cancel_menu())
+    await state.set_state(BotStates.waiting_for_chat_name)
+
+@router.message(BotStates.waiting_for_chat_name)
+async def create_chat(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT INTO chats (user_id, title) VALUES (?, ?)", (message.from_user.id, message.text.strip()))
+        await db.commit()
+    await state.clear()
+    await message.answer(f"✅ Создан диалог: **{message.text}**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @router.message(F.text == "🧠 Что ты обо мне знаешь?")
 async def btn_facts(message: Message):
@@ -258,6 +271,17 @@ async def btn_facts(message: Message):
     if facts: await message.answer(f"📋 **Мои знания о тебе:**\n\n{facts}", parse_mode="Markdown")
     else: await message.answer("Я пока ничего о тебе не знаю.")
 
+@router.message(F.text == "🧹 Очистить чат")
+async def btn_clear(message: Message):
+    chat_id = await get_chat_id(message.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM history WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM project_files WHERE chat_id = ?", (chat_id,))
+        await db.execute("UPDATE chats SET summary = '' WHERE id = ?", (chat_id,))
+        await db.commit()
+    await message.answer("🧹 Чат очищен.", reply_markup=get_main_menu())
+
+# --- GITHUB ---
 @router.message(F.text == "🐙 GitHub Деплой")
 async def btn_github(message: Message, state: FSMContext):
     settings = await get_settings(message.from_user.id)
@@ -312,20 +336,11 @@ async def cb_push_github(callback: CallbackQuery):
 async def cb_cancel_push(callback: CallbackQuery):
     await callback.message.edit_text("Ок, оставил код в чате.")
 
-@router.message(F.text == "🧹 Очистить чат")
-async def btn_clear(message: Message):
-    chat_id = await get_chat_id(message.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM history WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM project_files WHERE chat_id = ?", (chat_id,))
-        await db.execute("UPDATE chats SET summary = '' WHERE id = ?", (chat_id,))
-        await db.commit()
-    await message.answer("🧹 Чат очищен. (Факты о тебе сохранены).", reply_markup=get_main_menu())
-
 @router.callback_query(F.data == "cancel_action")
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await state.clear(); await callback.message.edit_text("❌ Отменено."); await callback.answer()
 
+# --- ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -343,7 +358,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("МЕГА-БОТ ЗАПУЩЕН!")
+    print("БОТ ЗАПУЩЕН!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
