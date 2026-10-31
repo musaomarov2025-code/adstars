@@ -26,7 +26,6 @@ XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1"
 DB_FILE = "bot_memory.db"
 
 router = Router()
-# Ставим жесткий тайм-аут 60 секунд, чтобы бот не висел вечно
 client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=60.0, max_retries=0)
 
 class BotStates(StatesGroup):
@@ -109,8 +108,8 @@ async def summarize_chat_async(chat_id: int):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT count(*) FROM history WHERE chat_id = ?", (chat_id,))
         count = (await cursor.fetchone())[0]
-        if count > 50:
-            cursor = await db.execute("SELECT id, role, content FROM history WHERE chat_id = ? ORDER BY id ASC LIMIT 20", (chat_id,))
+        if count > 25: # Уменьшили порог для фонового сжатия
+            cursor = await db.execute("SELECT id, role, content FROM history WHERE chat_id = ? ORDER BY id ASC LIMIT 10", (chat_id,))
             old_msgs = await cursor.fetchall()
             text = "\n".join([f"{m[1]}: {m[2]}" for m in old_msgs])
             try:
@@ -150,7 +149,9 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
         cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
         row = await cursor.fetchone()
         summary = row[0] if row and row[0] else ""
-        cursor = await db.execute("SELECT role, content FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 50", (chat_id,))
+        
+        # УМЕНЬШИЛИ ПАМЯТЬ ДО 15 СООБЩЕНИЙ ДЛЯ СКОРОСТИ
+        cursor = await db.execute("SELECT role, content FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 15", (chat_id,))
         history = [{"role": r[0], "content": r[1]} for r in reversed(await cursor.fetchall())]
         
     facts = await get_facts(user_id)
@@ -170,7 +171,15 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
             stream=True 
         )
         
+        # ЖЕСТКИЙ ТАЙМАУТ НА МОЛЧАНИЕ СЕРВЕРА
+        last_chunk_time = asyncio.get_event_loop().time()
+        
         async for chunk in stream:
+            now = asyncio.get_event_loop().time()
+            if now - last_chunk_time > 15: # Если 15 секунд тишины
+                raise asyncio.TimeoutError("Сервер xerosharc слишком долго тупит.")
+            last_chunk_time = now
+            
             if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                 full_text += chunk.choices[0].delta.content
                 if len(full_text) % 30 == 0:
@@ -222,19 +231,21 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
 
         asyncio.create_task(summarize_chat_async(chat_id))
 
-    except Exception as e:
-        logging.error(f"Ошибка стриминга: {e}")
-        # Если ошибка, удаляем "Думаю..." и пишем об ошибке
+    except asyncio.TimeoutError:
         try: await msg.delete()
         except: pass
-        await message.answer(f"⚠️ Ошибка API (скорее всего перегрузка xerosharc):\n`{e}`", parse_mode="Markdown")
+        await message.answer("⚠️ **Сервер xerosharc завис.**\nОн не прислал ответ за 15 секунд. Пожалуйста, нажми на кнопку еще раз или переформулируй вопрос.")
+    except Exception as e:
+        logging.error(f"Ошибка стриминга: {e}")
+        try: await msg.delete()
+        except: pass
+        await message.answer(f"⚠️ Ошибка API:\n`{e}`", parse_mode="Markdown")
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.", reply_markup=get_main_menu())
+    await message.answer("👋 Привет! Я твой умный ИИ-ассистент. (Ускоренная версия)", reply_markup=get_main_menu())
 
-# --- ВОЗВРАЩАЕМ ВСЕ КНОПКИ НА МЕСТО ---
 @router.message(F.text == "📂 Мои диалоги")
 async def btn_chats(message: Message):
     async with aiosqlite.connect(DB_FILE) as db:
@@ -281,7 +292,6 @@ async def btn_clear(message: Message):
         await db.commit()
     await message.answer("🧹 Чат очищен.", reply_markup=get_main_menu())
 
-# --- GITHUB ---
 @router.message(F.text == "🐙 GitHub Деплой")
 async def btn_github(message: Message, state: FSMContext):
     settings = await get_settings(message.from_user.id)
@@ -340,7 +350,6 @@ async def cb_cancel_push(callback: CallbackQuery):
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await state.clear(); await callback.message.edit_text("❌ Отменено."); await callback.answer()
 
-# --- ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -358,7 +367,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("БОТ ЗАПУЩЕН!")
+    print("БЫСТРЫЙ БОТ ЗАПУЩЕН!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
