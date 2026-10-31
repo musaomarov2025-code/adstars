@@ -43,7 +43,6 @@ class BotStates(StatesGroup):
     waiting_for_github_token = State()
     waiting_for_github_repo = State()
 
-# --- УМНЫЙ ПРОМПТ (С АВТОПАМЯТЬЮ) ---
 def get_base_prompt():
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     return (
@@ -53,11 +52,10 @@ def get_base_prompt():
         "1. Если просят код, оборачивай его: ```python filename=\"main.py\"\n...\n```.\n"
         "2. Если просят напомнить, пиши тег: [REMIND: YYYY-MM-DD HH:MM | текст].\n"
         "3. Если просят поискать в интернете: [SEARCH: запрос].\n"
-        "4. АВТОПАМЯТЬ: Если пользователь сообщает важный факт о себе (имя, язык программирования, проект), напиши тег [MEMORIZE: факт].\n"
+        "4. АВТОПАМЯТЬ: Если пользователь сообщает важный факт о себе, напиши тег [MEMORIZE: факт].\n"
         "5. Отвечай на русском."
     )
 
-# --- БЕЗОПАСНОЕ РЕДАКТИРОВАНИЕ ---
 async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_markup=None):
     try:
         await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -65,7 +63,6 @@ async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_m
         if "message is not modified" not in str(e) and "message to edit not found" not in str(e):
             pass
 
-# --- КЛАВИАТУРЫ ---
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📂 Мои диалоги"), KeyboardButton(text="➕ Новый диалог")],
@@ -87,7 +84,6 @@ def get_chats_menu(chats):
 def get_cancel_menu():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]])
 
-# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, summary TEXT)")
@@ -118,9 +114,7 @@ async def get_facts(user_id):
         rows = await cursor.fetchall()
         return "\n".join([f"- {r[0]}" for r in rows]) if rows else ""
 
-# --- УМНОЕ СЖАТИЕ ПАМЯТИ (В ФОНЕ) ---
 async def summarize_chat_async(chat_id: int):
-    """Сжимает старые сообщения, если их стало больше 50"""
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT count(*) FROM history WHERE chat_id = ?", (chat_id,))
         count = (await cursor.fetchone())[0]
@@ -131,28 +125,29 @@ async def summarize_chat_async(chat_id: int):
             text = "\n".join([f"{m[1]}: {m[2]}" for m in old_msgs])
             
             try:
-                # Тихо просим нейросеть сжать
                 resp = await client.chat.completions.create(
                     model="claude-haiku-4-5", 
                     messages=[{"role": "user", "content": f"Сожми этот диалог в саммари (сохрани суть и код):\n{text}"}],
                     max_tokens=1000
                 )
+                # ЗАЩИТА ОТ ПУСТОГО ОТВЕТА
+                if not resp.choices:
+                    return
                 new_summary = resp.choices[0].message.content
                 
                 cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
-                old_summary = (await cursor.fetchone())[0] or ""
+                row = await cursor.fetchone()
+                old_summary = row[0] if row and row[0] else ""
                 combined = old_summary + "\n" + new_summary
                 
                 await db.execute("UPDATE chats SET summary = ? WHERE id = ?", (combined[:4000], chat_id))
                 
-                # Удаляем старые 20 сообщений из истории (они уже в саммари)
                 ids = [str(m[0]) for m in old_msgs]
                 await db.execute(f"DELETE FROM history WHERE id IN ({','.join(ids)})")
                 await db.commit()
             except Exception as e:
                 logging.error(f"Ошибка сжатия: {e}")
 
-# --- ФОНОВАЯ ЗАДАЧА ДЛЯ НАПОМИНАНИЙ ---
 async def reminder_worker(bot: Bot):
     while True:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -166,21 +161,18 @@ async def reminder_worker(bot: Bot):
             await db.commit()
         await asyncio.sleep(30)
 
-# --- СТРИМИНГ И ОБРАБОТКА ТЕГОВ ---
 async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     async with aiosqlite.connect(DB_FILE) as db:
-        # Берем саммари
         cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
-        summary = (await cursor.fetchone())[0] or ""
+        row = await cursor.fetchone()
+        summary = row[0] if row and row[0] else ""
         
-        # Берем 50 последних сообщений
         cursor = await db.execute("SELECT role, content FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 50", (chat_id,))
         history = [{"role": r[0], "content": r[1]} for r in reversed(await cursor.fetchall())]
         
     facts = await get_facts(user_id)
-    
     sys_prompt = get_base_prompt()
     if summary: sys_prompt += f"\n\nКРАТКОЕ СОДЕРЖАНИЕ СТАРОГО ДИАЛОГА:\n{summary}"
     if facts: sys_prompt += f"\n\nЧТО ТЫ ЗНАЕШЬ О ПОЛЬЗОВАТЕЛЕ:\n{facts}"
@@ -199,7 +191,8 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
         )
         
         async for chunk in stream:
-            if chunk.choices[0].delta.content:
+            # ГЛАВНАЯ ЗАЩИТА ОТ ОШИБКИ list index out of range
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                 full_text += chunk.choices[0].delta.content
                 if len(full_text) % 30 == 0:
                     display_text = re.sub(r'\[(REMIND|SEARCH|MEMORIZE).*?\]', '', full_text)
@@ -212,14 +205,13 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
             await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", full_text))
             await db.commit()
 
-        # --- ОБРАБОТКА АВТОПАМЯТИ ---
+        # --- ТЕГИ ---
         memorize_matches = re.findall(r'\[MEMORIZE:\s*(.*?)\]', full_text)
         for fact in memorize_matches:
             async with aiosqlite.connect(DB_FILE) as db:
                 await db.execute("INSERT INTO facts (user_id, fact_text) VALUES (?, ?)", (user_id, fact))
                 await db.commit()
 
-        # --- ОБРАБОТКА НАПОМИНАНИЙ ---
         remind_match = re.search(r'\[REMIND:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|\s*(.*?)\]', full_text)
         if remind_match:
             dt_str, rem_text = remind_match.groups()
@@ -228,7 +220,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await db.commit()
             await message.answer(f"⏰ Ок, напомню в {dt_str}:\n_{rem_text}_", parse_mode="Markdown")
 
-        # --- ОБРАБОТКА ПОИСКА ---
         search_match = re.search(r'\[SEARCH:\s*(.*?)\]', full_text)
         if search_match:
             query = search_match.group(1)
@@ -242,7 +233,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
             await ai_request_stream(message, user_id, chat_id)
             return
 
-        # --- ПРЕДЛОЖЕНИЕ GITHUB ---
         pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
         matches = re.findall(pattern, full_text, re.DOTALL)
         if matches:
@@ -252,25 +242,21 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await db.commit()
             await message.answer("👇 Я написал код. Загрузить в GitHub?", reply_markup=get_github_action_kb())
 
-        # Запускаем сжатие в фоне (если надо)
         asyncio.create_task(summarize_chat_async(chat_id))
 
     except Exception as e:
         await safe_edit(msg, f"⚠️ Ошибка: {e}")
 
-# --- ХЕНДЛЕРЫ ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.\n\nЯ теперь запоминаю важные факты о тебе автоматически. Просто общайся со мной.", reply_markup=get_main_menu())
+    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.", reply_markup=get_main_menu())
 
 @router.message(F.text == "🧠 Что ты обо мне знаешь?")
 async def btn_facts(message: Message):
     facts = await get_facts(message.from_user.id)
-    if facts:
-        await message.answer(f"📋 **Мои знания о тебе:**\n\n{facts}", parse_mode="Markdown")
-    else:
-        await message.answer("Я пока ничего о тебе не знаю. Расскажи что-нибудь!")
+    if facts: await message.answer(f"📋 **Мои знания о тебе:**\n\n{facts}", parse_mode="Markdown")
+    else: await message.answer("Я пока ничего о тебе не знаю.")
 
 @router.message(F.text == "🐙 GitHub Деплой")
 async def btn_github(message: Message, state: FSMContext):
@@ -340,7 +326,6 @@ async def btn_clear(message: Message):
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await state.clear(); await callback.message.edit_text("❌ Отменено."); await callback.answer()
 
-# --- ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -358,7 +343,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("МЕГА-БОТ (Автопамять + Стриминг) ЗАПУЩЕН!")
+    print("МЕГА-БОТ ЗАПУЩЕН!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
