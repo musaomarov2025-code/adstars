@@ -64,6 +64,14 @@ BASE_SYSTEM_PROMPT = (
     "Отвечай на русском."
 )
 
+# --- БЕЗОПАСНОЕ РЕДАКТИРОВАНИЕ ---
+async def safe_edit(message: Message, text: str, parse_mode: str = None):
+    try:
+        await message.edit_text(text, parse_mode=parse_mode)
+    except Exception as e:
+        if "message is not modified" not in str(e) and "message to edit not found" not in str(e):
+            logging.error(f"Ошибка редактирования: {e}")
+
 # --- КЛАВИАТУРЫ ---
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
@@ -114,7 +122,6 @@ async def check_and_summarize(chat_id: int):
         cursor = await db.execute("SELECT count(*) FROM history WHERE chat_id = ?", (chat_id,))
         count = (await cursor.fetchone())[0]
         
-        # Если сообщений больше 25, сжимаем старые 10
         if count > 25: 
             cursor = await db.execute("SELECT id, role, content FROM history WHERE chat_id = ? ORDER BY id ASC LIMIT 10", (chat_id,))
             old_msgs = await cursor.fetchall()
@@ -214,13 +221,12 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
     except: pass
     
     try:
-        await check_and_summarize(chat_id) # Проверяем, не надо ли сжать память
+        await check_and_summarize(chat_id)
         
         async with aiosqlite.connect(DB_FILE) as db:
             cursor = await db.execute("SELECT summary, role FROM chats WHERE id = ?", (chat_id,))
             summary, role = await cursor.fetchone()
             
-            # Берем 15 последних сообщений
             cursor = await db.execute("SELECT role, content FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 15", (chat_id,))
             history = [{"role": r[0], "content": r[1]} for r in reversed(await cursor.fetchall())]
             
@@ -238,7 +244,7 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
         
         for model in ["claude-sonnet-4-6", "gpt-6.1-sol"]:
             try:
-                if status_msg: await status_msg.edit_text(f"⏳ {role} думает...")
+                if status_msg: await safe_edit(status_msg, f"⏳ {role} думает...")
                 resp = await client.chat.completions.create(model=model, messages=msgs, max_tokens=4000)
                 break
             except Exception as e:
@@ -250,7 +256,7 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
         search_match = re.search(r'\[SEARCH:\s*(.*?)\]', ans)
         if search_match:
             query = search_match.group(1).strip()
-            if status_msg: await status_msg.edit_text(f"🌐 Ищу в интернете: {query}...")
+            if status_msg: await safe_edit(status_msg, f"🌐 Ищу в интернете: {query}...")
             search_results = await search_web(query)
             
             async with aiosqlite.connect(DB_FILE) as db:
@@ -294,7 +300,8 @@ async def btn_new_chat(message: Message, state: FSMContext):
 @router.callback_query(F.data == "cancel_action")
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("❌ Действие отменено.")
+    try: await callback.message.edit_text("❌ Действие отменено.")
+    except: pass
     await callback.answer()
 
 @router.message(BotStates.waiting_for_chat_name)
@@ -314,7 +321,8 @@ async def btn_chats(message: Message):
 
 @router.callback_query(F.data.startswith("switch_"))
 async def switch_chat(callback: CallbackQuery):
-    await callback.message.edit_text("✅ Диалог выбран. Пиши задачу.")
+    try: await callback.message.edit_text("✅ Диалог выбран. Пиши задачу.")
+    except: pass
     await callback.answer()
 
 @router.message(F.text == "🐙 GitHub Деплой")
@@ -379,7 +387,8 @@ async def set_role(callback: CallbackQuery):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("UPDATE chats SET role = ? WHERE id = ?", (role, chat_id))
         await db.commit()
-    await callback.message.edit_text(f"✅ Роль: **{role}**", parse_mode="Markdown")
+    try: await callback.message.edit_text(f"✅ Роль: **{role}**", parse_mode="Markdown")
+    except: pass
     await callback.answer()
 
 # --- ФАЙЛЫ (ЧТЕНИЕ ДОКУМЕНТОВ) ---
@@ -406,9 +415,34 @@ async def handle_document(message: Message):
             await db.execute("INSERT INTO project_files (chat_id, filename, content) VALUES (?, ?, ?)", (chat_id, message.document.file_name, extracted_text))
             await db.commit()
             
-        await status.edit_text(f"✅ Файл `{message.document.file_name}` сохранен в проект!", parse_mode="Markdown")
+        await safe_edit(status, f"✅ Файл `{message.document.file_name}` сохранен в проект!", parse_mode="Markdown")
     except Exception as e:
-        await status.edit_text(f"Ошибка чтения файла: {e}")
+        await safe_edit(status, f"Ошибка чтения файла: {e}")
+
+# --- ФУНКЦИЯ РЕКУРСИВНОГО УДАЛЕНИЯ ВСЕГО РЕПОЗИТОРИЯ ---
+def recursive_delete_all(repo):
+    """Удаляет ВСЕ файлы в репозитории, включая вложенные папки."""
+    deleted_count = 0
+    
+    def delete_recursively(content):
+        nonlocal deleted_count
+        if isinstance(content, list):
+            for item in content:
+                delete_recursively(item)
+        else:
+            if content.type == "dir":
+                # Если это папка, заходим внутрь
+                delete_recursively(repo.get_contents(content.path))
+            else:
+                # Удаляем файл
+                repo.delete_file(content.path, f"Очистка репозитория", content.sha)
+                deleted_count += 1
+
+    # Получаем всё содержимое корня
+    root_contents = repo.get_contents("")
+    delete_recursively(root_contents)
+    
+    return deleted_count
 
 # --- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА (С GITHUB ДЕПЛОЕМ И УДАЛЕНИЕМ) ---
 @router.message(F.text)
@@ -436,34 +470,39 @@ async def handle_text(message: Message):
             # === УДАЛЕНИЕ ===
             if is_delete:
                 if "все" in text_lower or "репо" in text_lower:
+                    await safe_edit(status_msg, "🧨 Начинаю полную очистку репозитория (включая папки)...")
+                    
                     def clear_repo():
-                        contents = repo.get_contents("")
-                        for f in contents:
-                            repo.delete_file(f.path, "Очистка репозитория", f.sha)
-                        return "✅ Все файлы удалены из репозитория!"
+                        count = recursive_delete_all(repo)
+                        return f"✅ Репозиторий полностью очищен! Удалено файлов: {count}."
                     
                     res = await asyncio.to_thread(clear_repo)
-                    await status_msg.edit_text(res)
+                    await safe_edit(status_msg, res)
                     return
                 else:
-                    file_match = re.search(r'([\w\-]+\.\w+)', text)
+                    # Улучшенный поиск имени файла (включая вложенные пути)
+                    file_match = re.search(r'([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)', text)
                     if not file_match:
-                        await status_msg.edit_text("❌ Укажи имя файла с расширением (например, `main.py`), который нужно удалить.")
+                        await safe_edit(status_msg, "❌ Укажи точное имя файла с расширением (например, `main.py` или `folder/test.txt`), который нужно удалить.")
                         return
                     
                     fname = file_match.group(1)
-                    await status_msg.edit_text(f"🐙 Ищу и удаляю `{fname}`...")
+                    await safe_edit(status_msg, f"🐙 Ищу и удаляю `{fname}`...")
                     
                     def delete_file():
                         try:
                             contents = repo.get_contents(fname)
+                            if isinstance(contents, list):
+                                return f"❌ `{fname}` — это папка. Для удаления папки напиши 'Удали все'."
                             repo.delete_file(contents.path, f"Удаление {fname}", contents.sha)
                             return f"✅ Файл `{fname}` успешно удален из GitHub!"
                         except Exception as e:
-                            return f"❌ Ошибка (возможно файла нет): {e}"
+                            if "Not Found" in str(e):
+                                return f"❌ Файл `{fname}` не найден в репозитории."
+                            return f"❌ Ошибка: {e}"
                     
                     res = await asyncio.to_thread(delete_file)
-                    await status_msg.edit_text(res)
+                    await safe_edit(status_msg, res)
                     return
 
             # === ЗАГРУЗКА ===
@@ -473,7 +512,7 @@ async def handle_text(message: Message):
                     row = await cursor.fetchone()
                     
                 if not row:
-                    await status_msg.edit_text("❌ Нет кода для загрузки. Попроси меня сначала написать код.")
+                    await safe_edit(status_msg, "❌ Нет кода для загрузки. Попроси меня сначала написать код.")
                     return
                     
                 ans = row[0]
@@ -481,10 +520,10 @@ async def handle_text(message: Message):
                 matches = re.findall(pattern, ans, re.DOTALL)
                 
                 if not matches:
-                    await status_msg.edit_text("❌ Я не нашел в предыдущем сообщении кода с именем файла (формат ```python filename=\"main.py\").")
+                    await safe_edit(status_msg, "❌ Я не нашел в предыдущем сообщении кода с именем файла (формат ```python filename=\"main.py\").")
                     return
                     
-                await status_msg.edit_text("🐙 Пушу код в GitHub...")
+                await safe_edit(status_msg, "🐙 Пушу код в GitHub...")
                 
                 def push_files():
                     for fname, code in matches:
@@ -496,11 +535,11 @@ async def handle_text(message: Message):
                     return f"✅ Код успешно загружен в `{settings[1]}`!"
                     
                 res = await asyncio.to_thread(push_files)
-                await status_msg.edit_text(res)
+                await safe_edit(status_msg, res)
                 return
 
         except Exception as e:
-            await status_msg.edit_text(f"❌ Ошибка GitHub: {e}")
+            await safe_edit(status_msg, f"❌ Ошибка GitHub: {e}")
             return
     # --- КОНЕЦ ЛОГИКИ GITHUB ---
 
@@ -511,7 +550,7 @@ async def handle_text(message: Message):
     if url_match:
         content = await fetch_url(url_match.group(1))
         text = f"[Ссылка]: {content}\n\n[Вопрос]: {text.replace(url_match.group(1), '')}"
-        await status.edit_text("⏳ Прочитал ссылку, думаю...")
+        await safe_edit(status, "⏳ Прочитал ссылку, думаю...")
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
