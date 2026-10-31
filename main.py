@@ -30,7 +30,6 @@ if not BOT_TOKEN or not XEROSHARC_API_KEY:
     raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY!")
 
 router = Router()
-# Ставим жесткий тайм-аут 60 секунд
 client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=60.0, max_retries=0)
 
 class BotStates(StatesGroup):
@@ -112,7 +111,7 @@ async def get_facts(user_id):
         rows = await cursor.fetchall()
         return "\n".join([f"- {r[0]}" for r in rows]) if rows else ""
 
-# --- УМНОЕ СЖАТИЕ ПАМЯТИ ---
+# --- СЖАТИЕ ПАМЯТИ ---
 async def summarize_chat_async(chat_id: int):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT count(*) FROM history WHERE chat_id = ?", (chat_id,))
@@ -136,8 +135,8 @@ async def summarize_chat_async(chat_id: int):
                 ids = [str(m[0]) for m in old_msgs]
                 await db.execute(f"DELETE FROM history WHERE id IN ({','.join(ids)})")
                 await db.commit()
-            except Exception as e:
-                logging.error(f"Ошибка сжатия: {e}")
+            except Exception:
+                pass 
 
 # --- НАПОМИНАНИЯ ---
 async def reminder_worker(bot: Bot):
@@ -153,10 +152,9 @@ async def reminder_worker(bot: Bot):
             await db.commit()
         await asyncio.sleep(30)
 
-# --- ГЛАВНАЯ ЛОГИКА ИИ (С АВТО-ПЕРЕКЛЮЧЕНИЕМ) ---
+# --- ЛОГИКА ИИ (С ПЕРЕКЛЮЧЕНИЕМ МОДЕЛЕЙ) ---
 async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
         row = await cursor.fetchone()
@@ -173,7 +171,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     full_text = ""
     msg = await message.answer("⏳ Думаю...")
     
-    # СПИСОК МОДЕЛЕЙ: Если Claude упадет (503), он пойдет в GPT
     models_to_try = ["claude-sonnet-4-6", "gpt-6.1-sol"]
     
     for model in models_to_try:
@@ -188,7 +185,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
             last_chunk_time = asyncio.get_event_loop().time()
             async for chunk in stream:
                 now = asyncio.get_event_loop().time()
-                # Тайм-аут 15 секунд (если сервер завис)
                 if now - last_chunk_time > 15:
                     raise asyncio.TimeoutError("Сервер завис")
                 last_chunk_time = now
@@ -206,7 +202,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", full_text))
                 await db.commit()
 
-            # --- ОБРАБОТКА ТЕГОВ ---
             memorize_matches = re.findall(r'\[MEMORIZE:\s*(.*?)\]', full_text)
             for fact in memorize_matches:
                 async with aiosqlite.connect(DB_FILE) as db:
@@ -244,33 +239,22 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await message.answer("👇 Я написал код. Загрузить в GitHub?", reply_markup=get_github_action_kb())
 
             asyncio.create_task(summarize_chat_async(chat_id))
-            return # Выходим, если успешно ответили
+            return
 
         except Exception as e:
-            logging.error(f"Ошибка модели {model}: {e}")
             if model == models_to_try[-1]:
-                # Если упала последняя модель
                 try: await msg.delete()
                 except: pass
-                if "503" in str(e) or "502" in str(e) or "Timeout" in str(e):
-                    await message.answer("⚠️ **Все сервера xerosharc сейчас лежат (Ошибка 503/Таймаут).**\nПожалуйста, подожди 5-10 минут.")
-                else:
-                    await message.answer(f"⚠️ Ошибка API:\n`{e}`", parse_mode="Markdown")
+                await message.answer("⚠️ **Все сервера xerosharc сейчас лежат (Ошибка 503).**\nПожалуйста, подожди 5-10 минут.")
+                return
             else:
-                # Если упала первая модель, пробуем следующую
-                await safe_edit(msg, f"⏳ {model} перегружен. Пробую другую...")
+                await safe_edit(msg, f"⏳ {model} перегружен. Пробую резервную модель...")
 
-# --- ХЕНДЛЕРЫ ---
+# --- ВСЕ ХЕНДЛЕРЫ КНОПОК ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.\nОбщайся со мной свободно, я сам пойму, что нужно.", reply_markup=get_main_menu())
-
-@router.message(F.text == "🧠 Что ты обо мне знаешь?")
-async def btn_facts(message: Message):
-    facts = await get_facts(message.from_user.id)
-    if facts: await message.answer(f"📋 **Мои знания о тебе:**\n\n{facts}", parse_mode="Markdown")
-    else: await message.answer("Я пока ничего о тебе не знаю.")
+    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.\nОбщайся со мной свободно.", reply_markup=get_main_menu())
 
 @router.message(F.text == "📂 Мои диалоги")
 async def btn_chats(message: Message):
@@ -298,6 +282,12 @@ async def create_chat(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Создан диалог: **{message.text}**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
+@router.message(F.text == "🧠 Что ты обо мне знаешь?")
+async def btn_facts(message: Message):
+    facts = await get_facts(message.from_user.id)
+    if facts: await message.answer(f"📋 **Мои знания о тебе:**\n\n{facts}", parse_mode="Markdown")
+    else: await message.answer("Я пока ничего о тебе не знаю.")
+
 @router.message(F.text == "🧹 Очистить чат")
 async def btn_clear(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -312,6 +302,7 @@ async def btn_clear(message: Message):
 async def btn_help(message: Message):
     await message.answer("Просто пиши мне задачи! Я помню контекст, могу искать в интернете и загружать код на GitHub.")
 
+# --- GITHUB ---
 @router.message(F.text == "🐙 GitHub Деплой")
 async def btn_github(message: Message, state: FSMContext):
     settings = await get_settings(message.from_user.id)
@@ -370,6 +361,7 @@ async def cb_cancel_push(callback: CallbackQuery):
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await state.clear(); await callback.message.edit_text("❌ Отменено."); await callback.answer()
 
+# --- ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР ---
 @router.message(F.text)
 async def handle_text(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -387,7 +379,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("БОТ ЗАПУЩЕН (с авто-переключением моделей)!")
+    print("БОТ ЗАПУЩЕН!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
