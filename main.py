@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import re
+import base64
+import io
 import aiohttp
 import aiosqlite
 import datetime
@@ -24,13 +26,14 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 XEROSHARC_API_KEY = os.getenv("XEROSHARC_API_KEY")
 XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1")
+GH_TOKEN = os.getenv("GH_TOKEN") # Берем токен из переменных BotHost
+GH_REPO = os.getenv("GH_REPO")   # Берем репо из переменных BotHost
 DB_FILE = "bot_memory.db"
 
 if not BOT_TOKEN or not XEROSHARC_API_KEY:
     raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY!")
 
 router = Router()
-# Увеличили тайм-аут до 120 секунд, чтобы не рвать долгие ответы
 client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=120.0, max_retries=0)
 
 class BotStates(StatesGroup):
@@ -43,13 +46,13 @@ def get_base_prompt():
     return (
         f"Сейчас: {now}.\n"
         "Ты — умный ИИ-ассистент с доступом к GitHub пользователя через бэкенд. "
+        "Если пользователь присылает фото, внимательно изучи его. "
         "Если пользователь спрашивает про файлы, репозиторий, или говорит 'там', 'тут', 'в гитхабе' — ты знаешь, что речь идет о его GitHub-репозитории.\n"
         "ПРАВИЛА:\n"
         "1. Если просят код, оборачивай его: ```python filename=\"main.py\"\n...\n```.\n"
         "2. Если просят напомнить, пиши тег: [REMIND: YYYY-MM-DD HH:MM | текст].\n"
         "3. Если просят поискать в интернете: [SEARCH: запрос].\n"
-        "4. Если пользователь просит ЗАПОМНИТЬ факт, ты просто подтверди, что запомнил (бэкенд сам сохранит).\n"
-        "5. Отвечай на русском."
+        "4. Отвечай на русском."
     )
 
 async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_markup=None):
@@ -58,6 +61,48 @@ async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_m
     except Exception as e:
         if "message is not modified" not in str(e) and "message to edit not found" not in str(e):
             pass
+
+# --- СИНХРОНИЗАЦИЯ БАЗЫ ДАННЫХ С GITHUB ---
+async def restore_db_from_github():
+    """Скачивает базу из GitHub при запуске, если локальной нет"""
+    if not GH_TOKEN or not GH_REPO: return
+    if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0:
+        return # База уже есть, не перезаписываем
+        
+    try:
+        def download():
+            g = Github(GH_TOKEN)
+            repo = g.get_repo(GH_REPO)
+            contents = repo.get_contents(DB_FILE)
+            file_data = base64.b64decode(contents.content)
+            with open(DB_FILE, "wb") as f:
+                f.write(file_data)
+        await asyncio.to_thread(download)
+        print("✅ База данных успешно восстановлена из GitHub!")
+    except Exception as e:
+        print(f"⚠️ Не удалось восстановить БД из GitHub (возможно, это первый запуск): {e}")
+
+async def backup_db_to_github():
+    """Фоновая задача для сохранения базы в GitHub каждые 5 минут"""
+    while True:
+        await asyncio.sleep(300) # 5 минут
+        if not GH_TOKEN or not GH_REPO or not os.path.exists(DB_FILE): continue
+        
+        try:
+            def upload():
+                g = Github(GH_TOKEN)
+                repo = g.get_repo(GH_REPO)
+                with open(DB_FILE, "rb") as f:
+                    content = f.read()
+                try:
+                    contents = repo.get_contents(DB_FILE)
+                    repo.update_file(contents.path, "Auto-backup DB", content, contents.sha)
+                except:
+                    repo.create_file(DB_FILE, "Create DB backup", content)
+            await asyncio.to_thread(upload)
+            print("💾 База данных сохранена в GitHub (Auto-backup).")
+        except Exception as e:
+            print(f"❌ Ошибка автосохранения в GitHub: {e}")
 
 # --- КЛАВИАТУРЫ ---
 def get_main_menu():
@@ -99,7 +144,7 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, remind_time TEXT, text TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, fact_text TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, gh_token TEXT, gh_repo TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, selected_model TEXT DEFAULT 'claude-haiku-4-5')")
+        await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, selected_model TEXT DEFAULT 'claude-sonnet-4-6')")
         await db.commit()
 
 async def get_chat_id(user_id):
@@ -112,6 +157,11 @@ async def get_chat_id(user_id):
         return cursor.lastrowid
 
 async def get_settings(user_id):
+    # Если токен и репо есть в переменных окружения, используем их
+    if GH_TOKEN and GH_REPO:
+        return (GH_TOKEN, GH_REPO)
+        
+    # Иначе ищем в базе
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT gh_token, gh_repo FROM settings WHERE user_id = ?", (user_id,))
         return await cursor.fetchone()
@@ -122,16 +172,16 @@ async def get_facts(user_id):
         rows = await cursor.fetchall()
         return "\n".join([f"- {r[0]}" for r in rows]) if rows else ""
 
-async def add_fact(user_id, fact):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT INTO facts (user_id, fact_text) VALUES (?, ?)", (user_id, fact))
-        await db.commit()
-
 async def get_user_model(user_id):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT selected_model FROM user_settings WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
-        return row[0] if row else "claude-haiku-4-5"
+        return row[0] if row else "claude-sonnet-4-6"
+
+async def add_fact(user_id, fact):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT INTO facts (user_id, fact_text) VALUES (?, ?)", (user_id, fact))
+        await db.commit()
 
 async def summarize_chat_async(chat_id: int):
     async with aiosqlite.connect(DB_FILE) as db:
@@ -159,7 +209,6 @@ async def summarize_chat_async(chat_id: int):
             except Exception:
                 pass 
 
-# --- НАПОМИНАНИЯ ---
 async def reminder_worker(bot: Bot):
     while True:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -173,7 +222,6 @@ async def reminder_worker(bot: Bot):
             await db.commit()
         await asyncio.sleep(30)
 
-# --- ЛОГИКА ИИ (ИСПРАВЛЕННЫЙ СТРИМИНГ) ---
 async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
@@ -195,7 +243,7 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     msg = await message.answer("⏳ Думаю...")
     
     user_model = await get_user_model(user_id)
-    models_to_try = list(dict.fromkeys([user_model, "claude-haiku-4-5", "gpt-6.1-sol"]))
+    models_to_try = list(dict.fromkeys([user_model, "claude-sonnet-4-6", "gpt-6.1-sol"]))
     
     for model in models_to_try:
         try:
@@ -206,7 +254,6 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 stream=True 
             )
             
-            # Убрали жесткий таймер для каждого кусочка, ждем сколько нужно
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                     full_text += chunk.choices[0].delta.content
@@ -263,11 +310,11 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
             else:
                 await safe_edit(msg, f"⏳ {model} перегружен. Пробую резервную...")
 
-# --- ХЕНДЛЕРЫ КНОПОК ---
+# --- ОБРАБОТЧИКИ ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой ИИ-ассистент.", reply_markup=get_main_menu())
+    await message.answer("👋 Привет! Я твой ИИ-ассистент.\nТеперь я автоматически сохраняю свои мозги в GitHub!", reply_markup=get_main_menu())
 
 @router.message(F.text == "🤖 Выбрать модель")
 async def btn_models(message: Message):
@@ -391,6 +438,77 @@ async def cb_cancel_push(callback: CallbackQuery):
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     await state.clear(); await callback.message.edit_text("❌ Отменено."); await callback.answer()
 
+# --- ФОТО ---
+@router.message(F.photo)
+async def handle_photo(message: Message):
+    user_id = message.from_user.id
+    chat_id = await get_chat_id(user_id)
+    status_msg = await message.answer("⏳ Смотрю скриншот...")
+    try:
+        photo = message.photo[-1]
+        file_info = await message.bot.get_file(photo.file_id)
+        file_bytes = await message.bot.download_file(file_info.file_path)
+        base64_image = base64.b64encode(file_bytes.read()).decode('utf-8')
+        caption = message.caption or "Разбери это изображение."
+        
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Фото]: {caption}"))
+            await db.commit()
+        
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
+            row = await cursor.fetchone()
+            summary = row[0] if row and row[0] else ""
+            cursor = await db.execute("SELECT role, content FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 7", (chat_id,))
+            history = [{"role": r[0], "content": r[1]} for r in reversed(await cursor.fetchall())]
+        
+        sys_prompt = get_base_prompt()
+        if summary: sys_prompt += f"\n\nСАММАРИ:\n{summary}"
+        
+        content = [{"type": "text", "text": caption}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
+        msgs = [{"role": "system", "content": sys_prompt}] + history[:-1] + [{"role": "user", "content": content}]
+        
+        response = await client.chat.completions.create(model="claude-sonnet-4-6", messages=msgs, max_tokens=4000)
+        answer = response.choices[0].message.content
+        
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", answer))
+            await db.commit()
+            
+        await status_msg.delete()
+        await safe_answer(message, answer)
+
+    except Exception as e:
+        await status_msg.delete()
+        await message.answer(f"⚠️ Ошибка при чтении фото: {e}")
+
+@router.message(F.document)
+async def handle_document(message: Message):
+    user_id = message.from_user.id
+    chat_id = await get_chat_id(user_id)
+    if message.document.file_size > 20 * 1024 * 1024:
+        await message.answer("Файл слишком большой.")
+        return
+    status_msg = await message.answer("⏳ Читаю файл...")
+    try:
+        file_info = await message.bot.get_file(message.document.file_id)
+        file_bytes = await message.bot.download_file(file_info.file_path)
+        raw_data = file_bytes.read()
+        try: extracted_text = raw_data.decode('utf-8')
+        except:
+            await status_msg.delete()
+            await message.answer("Могу читать только текстовые файлы.")
+            return
+        prompt = f"Файл `{message.document.file_name}`:\n\n```\n{extracted_text[:20000]}\n```\n\n{message.caption or 'Проанализируй.'}"
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", prompt))
+            await db.commit()
+        await status_msg.delete()
+        await ai_request_stream(message, user_id, chat_id)
+    except Exception as e:
+        await status_msg.delete()
+        await message.answer(f"⚠️ Ошибка при чтении файла: {e}")
+
 # --- ОСНОВНОЙ ХЕНДЛЕР ---
 @router.message(F.text)
 async def handle_text(message: Message):
@@ -398,7 +516,6 @@ async def handle_text(message: Message):
     text = message.text
     text_lower = text.lower()
     
-    # --- ЯВНЫЙ ПЕРЕХВАТ ПАМЯТИ ---
     if text_lower.startswith("запомни") or text_lower.startswith("запомни,"):
         fact = text[7:].strip(" ,.")
         if fact:
@@ -412,8 +529,7 @@ async def handle_text(message: Message):
         if any(word in text_lower for word in ["удали", "удалить", "сотри", "очисти"]):
             status = await message.answer("⏳ Работаю с GitHub...")
             def process_deletion():
-                g = Github(settings[0])
-                repo = g.get_repo(settings[1])
+                g = Github(settings[0]); repo = g.get_repo(settings[1])
                 if "все" in text_lower or "репо" in text_lower:
                     def delete_recursive(content):
                         count = 0
@@ -426,16 +542,15 @@ async def handle_text(message: Message):
                                 count += 1
                         return count
                     total = delete_recursive(repo.get_contents(""))
-                    return f"✅ Репозиторий полностью очищен! Удалено файлов: {total}."
+                    return f"✅ Репозиторий очищен! Удалено: {total}."
                 
                 file_matches = re.findall(r'([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)', text)
-                if not file_matches: return "❌ Не нашел имен файлов. Напиши точнее, например: 'Удали main.py'"
-                deleted_count = 0
-                errors = []
+                if not file_matches: return "❌ Напиши точнее: 'Удали main.py'"
+                deleted_count = 0; errors = []
                 for fname in file_matches:
                     try:
                         contents = repo.get_contents(fname)
-                        if isinstance(contents, list): errors.append(f"`{fname}` - это папка.")
+                        if isinstance(contents, list): errors.append(f"`{fname}` - папка.")
                         else:
                             repo.delete_file(contents.path, f"Удаление {fname}", contents.sha)
                             deleted_count += 1
@@ -453,44 +568,29 @@ async def handle_text(message: Message):
             except Exception as e: await status.edit_text(f"❌ Ошибка GitHub: {e}")
             return 
 
-        if any(word in text_lower for word in ["какие файлы", "список файлов", "что в репо", "что в гитхаб", "там пусто", "пусто ли"]):
-            status = await message.answer("⏳ Смотрю файлы в GitHub...")
-            def get_files():
-                g = Github(settings[0])
-                repo = g.get_repo(settings[1])
-                return [item.path for item in repo.get_contents("")]
-            try:
-                files = await asyncio.to_thread(get_files)
-                if files:
-                    res = "📁 **Файлы в корне репозитория:**\n" + "\n".join([f"- `{f}`" for f in files])
-                    extra = f"Файлы: {', '.join(files)}"
-                else:
-                    res = "📁 Репозиторий пуст. В нем нет файлов."
-                    extra = "Репозиторий пуст."
-                await status.edit_text(res, parse_mode="Markdown")
-                
-                async with aiosqlite.connect(DB_FILE) as db:
-                    await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
-                    await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", f"[СИСТЕМА: Я проверил GitHub. {extra}]"))
-                    await db.commit()
-            except Exception as e: await status.edit_text(f"❌ Ошибка: {e}")
-            return 
-
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", text))
         await db.commit()
-        
     await ai_request_stream(message, message.from_user.id, chat_id)
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    
+    # Восстанавливаем базу из GitHub ДО запуска бота
+    await restore_db_from_github()
     await init_db()
+    
     bot = Bot(token=BOT_TOKEN)
     asyncio.create_task(reminder_worker(bot))
+    
+    # Запускаем фоновое сохранение в GitHub
+    if GH_TOKEN and GH_REPO:
+        asyncio.create_task(backup_db_to_github())
+    
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("УМНЫЙ БОТ ЗАПУЩЕН!")
+    print("БОТ ЗАПУЩЕН! (С авто-сохранением в GitHub)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
