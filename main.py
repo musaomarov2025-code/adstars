@@ -52,13 +52,12 @@ ROLES = {
     "Обычный": "Ты — умный ассистент. Отвечай кратко, по делу."
 }
 
-# --- УМНЫЙ ПРОМПТ (УЧИМ БОТА БЫТЬ ИНИЦИАТИВНЫМ) ---
 BASE_SYSTEM_PROMPT = (
     "{role_prompt}\n"
-    "Ты не просто исполнитель. Ты — опытный Tech Lead и Senior-разработчик. Твои правила:\n"
-    "1. НИКОГДА не пиши код слепо. Если задача требует уточнений (не указана БД, фреймворк, структура) — сначала задай вопросы, предложи варианты.\n"
+    "Ты не просто исполнитель. Ты — опытный Tech Lead. Твои правила:\n"
+    "1. НИКОГДА не пиши код слепо. Если задача требует уточнений — сначала задай вопросы, предложи варианты.\n"
     "2. Предлагай улучшения. Если пользователь просит сделать что-то неэффективно, предложи лучший вариант.\n"
-    "3. Пиши Production-ready код: с обработкой ошибок (try/except), логированием и комментариями.\n"
+    "3. Пиши Production-ready код: с обработкой ошибок, логированием и комментариями.\n"
     "4. У тебя ЕСТЬ доступ к GitHub через бэкенд. Если просят загрузить или удалить файлы — просто ответь 'Загружаю...' или 'Удаляю...', бэкенд сам всё сделает.\n"
     "5. Если нужны свежие данные, напиши СТРОГО тег [SEARCH: твой запрос].\n"
     "6. Если пишешь код для проекта, ВСЕГДА указывай имя файла: ```python filename=\"main.py\"\n...\n```.\n"
@@ -213,12 +212,12 @@ async def ai_request(message: Message, user_id: int, chat_id: int, status_msg: M
         
         search_match = re.search(r'\[SEARCH:\s*(.*?)\]', ans)
         if search_match:
-            query. = search_match.group(1).strip()
-            if status_msg: await status_msg.edit_text(f"🌐 Ищу в интернanswerете: {(fquery}...")
-            search_results = await search"_web(query)
+            query = search_match.group(1).strip()
+            if status_msg: await status_msg.edit_text(f"🌐 Ищу в интернете: {query}...")
+            search_results = await search_web(query)
             
-            async with aiosqlite✅.connect(DB_FILE) as db:
-                await db.execute С("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Результат поиска '{query}']:\n{search_results}"))
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Результат поиска '{query}']:\n{search_results}"))
                 await db.commit()
                 
             await ai_request(message, user_id, chat_id, status_msg, extra=f"Результаты поиска '{query}':\n{search_results}\n\nОтветь на предыдущий вопрос, используя эту информацию.")
@@ -262,7 +261,7 @@ async def create_chat(message: Message, state: FSMContext):
         await db.execute("INSERT INTO chats (user_id, title, summary, role) VALUES (?, ?, ?, ?)", (message.from_user.id, message.text.strip(), "", "Сеньор"))
         await db.commit()
     await state.clear()
-    await messageоздан диалог: **{message.text}**", reply_markup=get_main_menu(), parse_mode="Markdown")
+    await message.answer(f"✅ Создан диалог: **{message.text}**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @router.message(F.text == "📂 Мои диалоги")
 async def btn_chats(message: Message):
@@ -395,33 +394,37 @@ async def handle_text(message: Message):
         if settings and settings[0] and settings[1]:
             try:
                 await status.edit_text("🐙 Подключаюсь к GitHub...")
-                g = Github(settings[0])
-                repo = g.get_repo(settings[1])
                 
-                # 1. Логика УДАЛЕНИЯ
-                if "удали" in text_lower or "очисти" in text_lower:
-                    if "все" in text_lower or "репо" in text_lower:
-                        contents = repo.get_contents("")
-                        for content_file in contents:
-                            repo.delete_file(content_file.path, "Очистка репозитория", content_file.sha)
-                        await status.edit_text(f"✅ Все файлы в репозитории `{settings[1]}` успешно удалены!")
-                        return
-                    else:
-                        # Ищем имя файла (просто ищем слово с точкой)
-                        file_match = re.search(r'([\w\-]+\.\w+)', text)
-                        if file_match:
-                            fname = file_match.group(1)
-                            try:
-                                contents = repo.get_contents(fname)
-                                repo.delete_file(contents.path, "Удаление файла", contents.sha)
-                                await status.edit_text(f"✅ Файл `{fname}` удален из репозитория!")
-                                return
-                            except:
-                                await status.edit_text(f"❌ Файл `{fname}` не найден в репозитории.")
-                                return
+                # Оборачиваем синхронную библиотеку в асинхронный поток, чтобы бот не зависал!
+                def github_action():
+                    g = Github(settings[0])
+                    repo = g.get_repo(settings[1])
+                    
+                    if "удали" in text_lower or "очисти" in text_lower:
+                        if "все" in text_lower or "репо" in text_lower:
+                            contents = repo.get_contents("")
+                            for content_file in contents:
+                                repo.delete_file(content_file.path, "Очистка репозитория", content_file.sha)
+                            return f"✅ Все файлы в репозитории `{settings[1]}` успешно удалены!"
+                        else:
+                            file_match = re.search(r'([\w\-]+\.\w+)', text)
+                            if file_match:
+                                fname = file_match.group(1)
+                                try:
+                                    contents = repo.get_contents(fname)
+                                    repo.delete_file(contents.path, "Удаление файла", contents.sha)
+                                    return f"✅ Файл `{fname}` удален из репозитория!"
+                                except:
+                                    return f"❌ Файл `{fname}` не найден в репозитории."
+                    
+                    if any(word in text_lower for word in ["загрузи", "запушь", "добавь"]):
+                        return "NEED_PUSH"
+                        
+                    return None
+
+                result = await asyncio.to_thread(github_action)
                 
-                # 2. Логика ЗАГРУЗКИ
-                if any(word in text_lower for word in ["загрузи", "запушь", "добавь"]):
+                if result == "NEED_PUSH":
                     async with aiosqlite.connect(DB_FILE) as db:
                         cursor = await db.execute("SELECT content FROM history WHERE chat_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1", (chat_id,))
                         row = await cursor.fetchone()
@@ -431,17 +434,28 @@ async def handle_text(message: Message):
                             matches = re.findall(pattern, ans, re.DOTALL)
                             if matches:
                                 await status.edit_text("🐙 Пушу код в GitHub...")
-                                for fname, code in matches:
-                                    try:
-                                        contents = repo.get_contents(fname)
-                                        repo.update_file(contents.path, f"Update {fname}", code, contents.sha)
-                                    except:
-                                        repo.create_file(fname, f"Create {fname}", code)
+                                
+                                def push_action():
+                                    g = Github(settings[0])
+                                    repo = g.get_repo(settings[1])
+                                    for fname, code in matches:
+                                        try:
+                                            contents = repo.get_contents(fname)
+                                            repo.update_file(contents.path, f"Update {fname}", code, contents.sha)
+                                        except:
+                                            repo.create_file(fname, f"Create {fname}", code)
+                                    return True
+                                
+                                await asyncio.to_thread(push_action)
                                 await status.edit_text(f"✅ Код загружен в репозиторий `{settings[1]}`!")
                                 return
                             else:
                                 await status.edit_text("❌ Я не нашел в предыдущем сообщении кода с именем файла.")
                                 return
+                elif result:
+                    await status.edit_text(result)
+                    return
+                    
             except Exception as e:
                 await status.edit_text(f"❌ Ошибка GitHub: {e}")
                 return
