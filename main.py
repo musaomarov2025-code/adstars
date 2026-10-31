@@ -112,7 +112,7 @@ async def backup_db_to_github():
             await asyncio.to_thread(upload)
         except Exception: pass
 
-# --- БАЗА ДАННЫХ (С АВТО-МИГРАЦИЕЙ) ---
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, summary TEXT)")
@@ -124,7 +124,7 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER PRIMARY KEY, selected_model TEXT DEFAULT 'claude-sonnet-4-6', mode TEXT DEFAULT 'Обычный')")
         await db.commit()
 
-        # Миграция для старых баз
+        # Миграция для старых баз (исправляет ошибку no such column: mode)
         try:
             await db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT DEFAULT 'Обычный'")
             await db.commit()
@@ -293,12 +293,7 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
                 await message.answer_document(document=file_to_send, caption=f"📄 Документ `{fname}` готов!")
                 return
 
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Заново", callback_data="regen_text"),
-                 InlineKeyboardButton(text="➡️ Продолжить", callback_data="continue_text")]
-            ])
-            await message.answer("👇", reply_markup=kb)
-
+            # Кнопки Заново и Продолжить УБРАНЫ. Сразу проверяем код.
             pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
             matches = re.findall(pattern, full_text, re.DOTALL)
             if matches:
@@ -508,27 +503,6 @@ async def cb_exec_code(callback: CallbackQuery):
     result = await execute_code(row[0], "python")
     await callback.message.answer(f"▶️ **Результат:**\n<pre>{result}</pre>", parse_mode="HTML")
 
-@router.callback_query(F.data == "regen_text")
-async def cb_regen(callback: CallbackQuery):
-    chat_id = await get_chat_id(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM history WHERE chat_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1", (chat_id,))
-        cursor = await db.execute("SELECT content FROM history WHERE chat_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1", (chat_id,))
-        row = await cursor.fetchone()
-        await db.commit()
-    if row:
-        await callback.message.delete()
-        await ai_request_stream(callback.message, callback.from_user.id, chat_id)
-
-@router.callback_query(F.data == "continue_text")
-async def cb_continue(callback: CallbackQuery):
-    chat_id = await get_chat_id(callback.from_user.id)
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", "Продолжи ответ с того места, где ты остановился."))
-        await db.commit()
-    await callback.message.delete()
-    await ai_request_stream(callback.message, callback.from_user.id, chat_id)
-
 @router.message(F.photo)
 async def handle_photo(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -609,6 +583,39 @@ async def handle_text(message: Message):
     settings = await get_settings(message.from_user.id)
     
     if settings and settings[0] and settings[1]:
+        # 1. ЕСЛИ ПРОСЯТ ПОКАЗАТЬ ФАЙЛЫ ИЛИ ПРОВЕРИТЬ ПРОЕКТ
+        if re.search(r'(проверь|посмотри|какие файлы|что в|покажи|список)', text_lower) and re.search(r'(проект|код|репо|гит|файл)', text_lower):
+            status = await message.answer("⏳ Скачиваю файлы из GitHub для анализа...")
+            def get_files_info():
+                g = Github(settings[0]); repo = g.get_repo(settings[1])
+                files_info = []
+                contents = repo.get_contents("")
+                for item in contents:
+                    if item.type == "file":
+                        try:
+                            file_content = item.decoded_content.decode('utf-8')[:10000]
+                            files_info.append(f"--- Файл: {item.name} ---\n{file_content}\n")
+                        except:
+                            files_info.append(f"--- Файл: {item.name} (бинарный или ошибка чтения) ---\n")
+                    else:
+                        files_info.append(f"--- Папка: {item.name} ---")
+                return "\n".join(files_info)
+            
+            try:
+                files_data = await asyncio.to_thread(get_files_info)
+                await status.edit_text("🧠 Изучаю код проекта...")
+                
+                async with aiosqlite.connect(DB_FILE) as db:
+                    prompt = f"Пользователь просит проверить проект. Вот содержимое его репозитория:\n{files_data}\n\nПроанализируй код, найди ошибки и предложи улучшения."
+                    await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", prompt))
+                    await db.commit()
+                
+                await ai_request_stream(message, message.from_user.id, chat_id)
+            except Exception as e:
+                await status.edit_text(f"❌ Ошибка при чтении репозитория: {e}")
+            return
+
+        # 2. ПРОСТО СПИСОК ФАЙЛОВ (без чтения содержимого)
         if re.search(r'(файл|репо|гит|шит|пусто|github|гитхаб)', text_lower):
             status = await message.answer("⏳ Смотрю файлы в GitHub...")
             def get_files():
@@ -626,6 +633,7 @@ async def handle_text(message: Message):
             except Exception as e: await status.edit_text(f"❌ Ошибка GitHub: {e}")
             return 
 
+        # 3. УДАЛЕНИЕ
         if any(word in text_lower for word in ["удали", "удалить", "сотри", "очисти"]):
             status = await message.answer("⏳ Работаю с GitHub...")
             def process_deletion():
