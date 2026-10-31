@@ -20,12 +20,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 XEROSHARC_API_KEY = os.getenv("XEROSHARC_API_KEY")
 XEROSHARC_BASE_URL = os.getenv("XEROSHARC_BASE_URL", "https://xerosharc.site/v1")
 DB_FILE = "bot_memory.db"
 
+if not BOT_TOKEN or not XEROSHARC_API_KEY:
+    raise ValueError("Не заданы BOT_TOKEN или XEROSHARC_API_KEY!")
+
 router = Router()
+# Ставим жесткий тайм-аут 60 секунд
 client = AsyncOpenAI(api_key=XEROSHARC_API_KEY, base_url=XEROSHARC_BASE_URL, timeout=60.0, max_retries=0)
 
 class BotStates(StatesGroup):
@@ -46,6 +51,7 @@ def get_base_prompt():
         "5. Отвечай на русском."
     )
 
+# --- БЕЗОПАСНОЕ РЕДАКТИРОВАНИЕ ---
 async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_markup=None):
     try:
         await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
@@ -53,6 +59,7 @@ async def safe_edit(message: Message, text: str, parse_mode: str = None, reply_m
         if "message is not modified" not in str(e) and "message to edit not found" not in str(e):
             pass
 
+# --- КЛАВИАТУРЫ ---
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📂 Мои диалоги"), KeyboardButton(text="➕ Новый диалог")],
@@ -74,6 +81,7 @@ def get_chats_menu(chats):
 def get_cancel_menu():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]])
 
+# --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT, summary TEXT)")
@@ -104,11 +112,12 @@ async def get_facts(user_id):
         rows = await cursor.fetchall()
         return "\n".join([f"- {r[0]}" for r in rows]) if rows else ""
 
+# --- УМНОЕ СЖАТИЕ ПАМЯТИ ---
 async def summarize_chat_async(chat_id: int):
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT count(*) FROM history WHERE chat_id = ?", (chat_id,))
         count = (await cursor.fetchone())[0]
-        if count > 25: # Уменьшили порог для фонового сжатия
+        if count > 25:
             cursor = await db.execute("SELECT id, role, content FROM history WHERE chat_id = ? ORDER BY id ASC LIMIT 10", (chat_id,))
             old_msgs = await cursor.fetchall()
             text = "\n".join([f"{m[1]}: {m[2]}" for m in old_msgs])
@@ -130,6 +139,7 @@ async def summarize_chat_async(chat_id: int):
             except Exception as e:
                 logging.error(f"Ошибка сжатия: {e}")
 
+# --- НАПОМИНАНИЯ ---
 async def reminder_worker(bot: Bot):
     while True:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -143,14 +153,14 @@ async def reminder_worker(bot: Bot):
             await db.commit()
         await asyncio.sleep(30)
 
+# --- ГЛАВНАЯ ЛОГИКА ИИ (С АВТО-ПЕРЕКЛЮЧЕНИЕМ) ---
 async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    
     async with aiosqlite.connect(DB_FILE) as db:
         cursor = await db.execute("SELECT summary FROM chats WHERE id = ?", (chat_id,))
         row = await cursor.fetchone()
         summary = row[0] if row and row[0] else ""
-        
-        # УМЕНЬШИЛИ ПАМЯТЬ ДО 15 СООБЩЕНИЙ ДЛЯ СКОРОСТИ
         cursor = await db.execute("SELECT role, content FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 15", (chat_id,))
         history = [{"role": r[0], "content": r[1]} for r in reversed(await cursor.fetchall())]
         
@@ -163,88 +173,104 @@ async def ai_request_stream(message: Message, user_id: int, chat_id: int):
     full_text = ""
     msg = await message.answer("⏳ Думаю...")
     
-    try:
-        stream = await client.chat.completions.create(
-            model="claude-sonnet-4-6", 
-            messages=msgs,
-            max_tokens=4000,
-            stream=True 
-        )
-        
-        # ЖЕСТКИЙ ТАЙМАУТ НА МОЛЧАНИЕ СЕРВЕРА
-        last_chunk_time = asyncio.get_event_loop().time()
-        
-        async for chunk in stream:
-            now = asyncio.get_event_loop().time()
-            if now - last_chunk_time > 15: # Если 15 секунд тишины
-                raise asyncio.TimeoutError("Сервер xerosharc слишком долго тупит.")
-            last_chunk_time = now
+    # СПИСОК МОДЕЛЕЙ: Если Claude упадет (503), он пойдет в GPT
+    models_to_try = ["claude-sonnet-4-6", "gpt-6.1-sol"]
+    
+    for model in models_to_try:
+        try:
+            stream = await client.chat.completions.create(
+                model=model, 
+                messages=msgs,
+                max_tokens=4000,
+                stream=True 
+            )
             
-            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                full_text += chunk.choices[0].delta.content
-                if len(full_text) % 30 == 0:
-                    display_text = re.sub(r'\[(REMIND|SEARCH|MEMORIZE).*?\]', '', full_text)
-                    await safe_edit(msg, display_text + " █") 
-                    
-        display_text = re.sub(r'\[(REMIND|SEARCH|MEMORIZE).*?\]', '', full_text).strip()
-        await safe_edit(msg, display_text if display_text else "Готово.")
-        
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", full_text))
-            await db.commit()
-
-        memorize_matches = re.findall(r'\[MEMORIZE:\s*(.*?)\]', full_text)
-        for fact in memorize_matches:
+            last_chunk_time = asyncio.get_event_loop().time()
+            async for chunk in stream:
+                now = asyncio.get_event_loop().time()
+                # Тайм-аут 15 секунд (если сервер завис)
+                if now - last_chunk_time > 15:
+                    raise asyncio.TimeoutError("Сервер завис")
+                last_chunk_time = now
+                
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    full_text += chunk.choices[0].delta.content
+                    if len(full_text) % 30 == 0:
+                        display_text = re.sub(r'\[(REMIND|SEARCH|MEMORIZE).*?\]', '', full_text)
+                        await safe_edit(msg, display_text + " █") 
+                        
+            display_text = re.sub(r'\[(REMIND|SEARCH|MEMORIZE).*?\]', '', full_text).strip()
+            await safe_edit(msg, display_text if display_text else "Готово.")
+            
             async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute("INSERT INTO facts (user_id, fact_text) VALUES (?, ?)", (user_id, fact))
+                await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "assistant", full_text))
                 await db.commit()
 
-        remind_match = re.search(r'\[REMIND:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|\s*(.*?)\]', full_text)
-        if remind_match:
-            dt_str, rem_text = remind_match.groups()
-            async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute("INSERT INTO reminders (user_id, remind_time, text) VALUES (?, ?, ?)", (user_id, dt_str, rem_text))
-                await db.commit()
-            await message.answer(f"⏰ Ок, напомню в {dt_str}:\n_{rem_text}_", parse_mode="Markdown")
+            # --- ОБРАБОТКА ТЕГОВ ---
+            memorize_matches = re.findall(r'\[MEMORIZE:\s*(.*?)\]', full_text)
+            for fact in memorize_matches:
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.execute("INSERT INTO facts (user_id, fact_text) VALUES (?, ?)", (user_id, fact))
+                    await db.commit()
 
-        search_match = re.search(r'\[SEARCH:\s*(.*?)\]', full_text)
-        if search_match:
-            query = search_match.group(1)
-            await message.answer(f"🌐 Ищу: {query}...")
-            async with aiohttp.ClientSession() as s:
-                async with s.get(f"https://s.jina.ai/{query}", timeout=60) as r:
-                    res = (await r.text())[:20000]
-            async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Поиск '{query}']:\n{res}"))
-                await db.commit()
-            await ai_request_stream(message, user_id, chat_id)
-            return
+            remind_match = re.search(r'\[REMIND:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*\|\s*(.*?)\]', full_text)
+            if remind_match:
+                dt_str, rem_text = remind_match.groups()
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.execute("INSERT INTO reminders (user_id, remind_time, text) VALUES (?, ?, ?)", (user_id, dt_str, rem_text))
+                    await db.commit()
+                await message.answer(f"⏰ Ок, напомню в {dt_str}:\n_{rem_text}_", parse_mode="Markdown")
 
-        pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
-        matches = re.findall(pattern, full_text, re.DOTALL)
-        if matches:
-            async with aiosqlite.connect(DB_FILE) as db:
-                for fname, code in matches:
-                    await db.execute("INSERT INTO project_files (chat_id, filename, content) VALUES (?, ?, ?)", (chat_id, fname, code))
-                await db.commit()
-            await message.answer("👇 Я написал код. Загрузить в GitHub?", reply_markup=get_github_action_kb())
+            search_match = re.search(r'\[SEARCH:\s*(.*?)\]', full_text)
+            if search_match:
+                query = search_match.group(1)
+                await message.answer(f"🌐 Ищу: {query}...")
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(f"https://s.jina.ai/{query}", timeout=60) as r:
+                        res = (await r.text())[:20000]
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.execute("INSERT INTO history (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, "user", f"[Поиск '{query}']:\n{res}"))
+                    await db.commit()
+                await ai_request_stream(message, user_id, chat_id)
+                return
 
-        asyncio.create_task(summarize_chat_async(chat_id))
+            pattern = r"```(?:\w+)?\s*filename=[\"'](.*?)[\"']\n(.*?)```"
+            matches = re.findall(pattern, full_text, re.DOTALL)
+            if matches:
+                async with aiosqlite.connect(DB_FILE) as db:
+                    for fname, code in matches:
+                        await db.execute("INSERT INTO project_files (chat_id, filename, content) VALUES (?, ?, ?)", (chat_id, fname, code))
+                    await db.commit()
+                await message.answer("👇 Я написал код. Загрузить в GitHub?", reply_markup=get_github_action_kb())
 
-    except asyncio.TimeoutError:
-        try: await msg.delete()
-        except: pass
-        await message.answer("⚠️ **Сервер xerosharc завис.**\nОн не прислал ответ за 15 секунд. Пожалуйста, нажми на кнопку еще раз или переформулируй вопрос.")
-    except Exception as e:
-        logging.error(f"Ошибка стриминга: {e}")
-        try: await msg.delete()
-        except: pass
-        await message.answer(f"⚠️ Ошибка API:\n`{e}`", parse_mode="Markdown")
+            asyncio.create_task(summarize_chat_async(chat_id))
+            return # Выходим, если успешно ответили
 
+        except Exception as e:
+            logging.error(f"Ошибка модели {model}: {e}")
+            if model == models_to_try[-1]:
+                # Если упала последняя модель
+                try: await msg.delete()
+                except: pass
+                if "503" in str(e) or "502" in str(e) or "Timeout" in str(e):
+                    await message.answer("⚠️ **Все сервера xerosharc сейчас лежат (Ошибка 503/Таймаут).**\nПожалуйста, подожди 5-10 минут.")
+                else:
+                    await message.answer(f"⚠️ Ошибка API:\n`{e}`", parse_mode="Markdown")
+            else:
+                # Если упала первая модель, пробуем следующую
+                await safe_edit(msg, f"⏳ {model} перегружен. Пробую другую...")
+
+# --- ХЕНДЛЕРЫ ---
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await get_chat_id(message.from_user.id)
-    await message.answer("👋 Привет! Я твой умный ИИ-ассистент. (Ускоренная версия)", reply_markup=get_main_menu())
+    await message.answer("👋 Привет! Я твой умный ИИ-ассистент.\nОбщайся со мной свободно, я сам пойму, что нужно.", reply_markup=get_main_menu())
+
+@router.message(F.text == "🧠 Что ты обо мне знаешь?")
+async def btn_facts(message: Message):
+    facts = await get_facts(message.from_user.id)
+    if facts: await message.answer(f"📋 **Мои знания о тебе:**\n\n{facts}", parse_mode="Markdown")
+    else: await message.answer("Я пока ничего о тебе не знаю.")
 
 @router.message(F.text == "📂 Мои диалоги")
 async def btn_chats(message: Message):
@@ -259,10 +285,6 @@ async def switch_chat(callback: CallbackQuery):
     except: pass
     await callback.answer()
 
-@router.message(F.text == "❓ Помощь")
-async def btn_help(message: Message):
-    await message.answer("Просто пиши мне задачи! Я помню контекст, могу искать в интернете и загружать код на GitHub.")
-
 @router.message(F.text == "➕ Новый диалог")
 async def btn_new_chat(message: Message, state: FSMContext):
     await message.answer("Название нового диалога:", reply_markup=get_cancel_menu())
@@ -276,12 +298,6 @@ async def create_chat(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Создан диалог: **{message.text}**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
-@router.message(F.text == "🧠 Что ты обо мне знаешь?")
-async def btn_facts(message: Message):
-    facts = await get_facts(message.from_user.id)
-    if facts: await message.answer(f"📋 **Мои знания о тебе:**\n\n{facts}", parse_mode="Markdown")
-    else: await message.answer("Я пока ничего о тебе не знаю.")
-
 @router.message(F.text == "🧹 Очистить чат")
 async def btn_clear(message: Message):
     chat_id = await get_chat_id(message.from_user.id)
@@ -291,6 +307,10 @@ async def btn_clear(message: Message):
         await db.execute("UPDATE chats SET summary = '' WHERE id = ?", (chat_id,))
         await db.commit()
     await message.answer("🧹 Чат очищен.", reply_markup=get_main_menu())
+
+@router.message(F.text == "❓ Помощь")
+async def btn_help(message: Message):
+    await message.answer("Просто пиши мне задачи! Я помню контекст, могу искать в интернете и загружать код на GitHub.")
 
 @router.message(F.text == "🐙 GitHub Деплой")
 async def btn_github(message: Message, state: FSMContext):
@@ -367,7 +387,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    print("БЫСТРЫЙ БОТ ЗАПУЩЕН!")
+    print("БОТ ЗАПУЩЕН (с авто-переключением моделей)!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
