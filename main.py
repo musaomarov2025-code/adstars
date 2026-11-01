@@ -690,7 +690,7 @@ async def handle_text(message: Message):
         if re.search(r'(файл|репо|гит|шит|пусто|github|гитхаб)', text_lower) and not "скинь" in text_lower:
             status = await message.answer("⏳ Смотрю файлы в GitHub...")
             def get_files():
-                g Github(settings[0]); repo = g.get_repo(settings[1])
+                g = Github(settings[0]); repo = g.get_repo(settings[1])
                 return [item.path for item in repo.get_contents("")]
             try:
                 files = await asyncio.to_thread(get_files)
