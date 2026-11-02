@@ -4,7 +4,6 @@ import base64
 import json
 import httpx
 import asyncio
-import threading
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -23,6 +22,7 @@ GH_TOKEN = os.getenv("GITHUB_TOKEN")
 GH_USER = os.getenv("GITHUB_USERNAME")
 GH_REPO = os.getenv("GITHUB_REPO")
 
+# ВСТАВЬ СЮДА НОВЫЙ ДОМЕН
 WEB_APP_URL = "https://bot-1793460794-9525-savik.bothost.tech"
 
 bot = Bot(token=BOT_TOKEN)
@@ -205,23 +205,26 @@ async def api_chat(request: Request):
 async def serve_index():
     return HTMLResponse(content=HTML_CONTENT)
 
-# --- ТЕСТОВАЯ СТРАНИЦА (чтобы проверить, работает ли сайт) ---
 @app.get("/ping")
 async def ping():
     return {"status": "ok", "message": "Web server is running!"}
 
-# --- ЗАПУСК В ОТДЕЛЬНОМ ПОТОКЕ ---
-def run_web_server():
-    # BotHost обычно требует порт 3000, жестко фиксируем его
-    uvicorn.run(app, host="0.0.0.0", port=3000, log_level="info")
-
+# --- БЕЗОПАСНЫЙ ЗАПУСК (WEB + BOT) ---
 async def main():
-    # 1. Запускаем веб-сервер в фоне (отдельный поток)
-    threading.Thread(target=run_web_server, daemon=True).start()
+    # Получаем порт из настроек BotHost (у тебя стоит 3000)
+    port = int(os.getenv("PORT", 3000))
     
-    # 2. Запускаем бота
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    
+    # Запускаем веб-сервер в основной петле событий
+    server_task = asyncio.create_task(server.serve())
+    
+    # Запускаем бота
+    bot_task = asyncio.create_task(dp.start_polling(bot))
+    
+    # Ждем выполнения обоих
+    await asyncio.gather(server_task, bot_task)
 
 if __name__ == "__main__":
     asyncio.run(main())
