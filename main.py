@@ -6,8 +6,7 @@ import httpx
 import asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
@@ -31,72 +30,141 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
-# Временное хранилище контекста (в памяти)
 user_contexts = {}
+
+# --- ИНТЕРФЕЙС MINI APP (ВШИТ ПРЯМО В КОД) ---
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Assistant</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        :root { --bg: #1e1e24; --bg2: #2b2b36; --text: #e0e0e0; --accent: #d452d4; --border: #3d3d4a; }
+        body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+        .header { padding: 15px; background: var(--bg2); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
+        .model-select { background: transparent; color: var(--text); border: none; font-size: 16px; font-weight: 500; outline: none; }
+        .chat { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
+        .message { max-width: 85%; padding: 12px 16px; border-radius: 18px; line-height: 1.4; font-size: 15px; white-space: pre-wrap; }
+        .msg-user { align-self: flex-end; background: var(--bg2); border-bottom-right-radius: 4px; }
+        .msg-ai { align-self: flex-start; background: rgba(212, 82, 212, 0.1); border: 1px solid rgba(212, 82, 212, 0.3); border-bottom-left-radius: 4px; }
+        .stats { font-size: 11px; color: #888; margin-top: 6px; text-align: right; }
+        .input-area { padding: 10px; background: var(--bg2); display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); }
+        .tools-row { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 5px; }
+        .tool-btn { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 20px; font-size: 13px; white-space: nowrap; cursor: pointer; }
+        .input-row { display: flex; gap: 10px; align-items: center; }
+        .input-row input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 12px; border-radius: 20px; outline: none; font-size: 15px; }
+        .send-btn { background: var(--accent); color: white; border: none; width: 44px; height: 44px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-size: 18px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <select class="model-select" id="model">
+            <option value="claude-sonnet-5-5">claude-sonnet-5-5</option>
+            <option value="claude-opus-5-5">claude-opus-5-5</option>
+            <option value="gpt-5.6-sol">gpt-5.6-sol</option>
+            <option value="gpt-5.5">gpt-5.5</option>
+        </select>
+        <div style="font-size: 20px; cursor: pointer;">☰</div>
+    </div>
+    
+    <div class="chat" id="chat">
+        <div class="message msg-ai">Привет! Я твой ИИ-ассистент. Могу управлять твоим GitHub, запускать код и работать с файлами. Что делаем?</div>
+    </div>
+
+    <div class="input-area">
+        <div class="tools-row">
+            <button class="tool-btn">📷 Камера</button>
+            <button class="tool-btn">📁 Файлы</button>
+            <button class="tool-btn">🌐 Поиск: Авто</button>
+            <button class="tool-btn">💡 Рассуждение</button>
+        </div>
+        <div class="input-row">
+            <input type="text" id="messageInput" placeholder="Спроси о чем-нибудь..." onkeypress="handleKeyPress(event)">
+            <button class="send-btn" onclick="sendMessage()">➤</button>
+        </div>
+    </div>
+
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.expand();
+        const userId = tg.initDataUnsafe?.user?.id || 123456789;
+
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const text = input.value.trim();
+            if (!text) return;
+
+            addMessage(text, 'user');
+            input.value = '';
+
+            const loadingId = 'loading-' + Date.now();
+            addMessage('Думаю...', 'ai', loadingId);
+
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_id: userId,
+                        text: text,
+                        model: document.getElementById('model').value
+                    })
+                });
+
+                const data = await response.json();
+                
+                const loadingEl = document.getElementById(loadingId);
+                if (loadingEl) loadingEl.remove();
+
+                addMessage(data.answer, 'ai', null, data.time, data.tokens);
+
+            } catch (e) {
+                const loadingEl = document.getElementById(loadingId);
+                if (loadingEl) loadingEl.remove();
+                addMessage('Ошибка подключения к серверу.', 'ai');
+            }
+        }
+
+        function addMessage(text, type, id = null, time = null, tokens = null) {
+            const chat = document.getElementById('chat');
+            const div = document.createElement('div');
+            div.className = `message msg-${type}`;
+            if (id) div.id = id;
+            
+            div.innerText = text; 
+            
+            if (time !== null && tokens !== null) {
+                const statsDiv = document.createElement('div');
+                statsDiv.className = 'stats';
+                statsDiv.innerText = `⏱ ${time} сек | 🪙 ${tokens} токенов`;
+                div.appendChild(statsDiv);
+            }
+            
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight;
+        }
+
+        function handleKeyPress(e) {
+            if (e.key === 'Enter') sendMessage();
+        }
+    </script>
+</body>
+</html>
+"""
 
 # --- ИНСТРУМЕНТЫ (TOOLS) ДЛЯ ИИ ---
 tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "list_github_files",
-            "description": "Показать список файлов в репозитории GitHub",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_github_file",
-            "description": "Удалить файл из репозитория GitHub",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string", "description": "Путь к файлу (например, bot.py)"}},
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_all_github_files",
-            "description": "Удалить ВСЕ файлы из репозитория GitHub",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "upload_github_file",
-            "description": "Загрузить или обновить файл в репозитории GitHub",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Путь к файлу"},
-                    "content": {"type": "string", "description": "Содержимое файла"}
-                },
-                "required": ["path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_code_piston",
-            "description": "Запустить код на Python, JS, C++ и т.д. через Piston API",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "language": {"type": "string", "description": "Язык (python, javascript, cpp и т.д.)"},
-                    "code": {"type": "string", "description": "Код для запуска"}
-                },
-                "required": ["language", "code"]
-            }
-        }
-    }
+    {"type": "function", "function": {"name": "list_github_files", "description": "Показать список файлов в репозитории", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "delete_github_file", "description": "Удалить файл из репозитория", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "delete_all_github_files", "description": "Удалить ВСЕ файлы", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "upload_github_file", "description": "Загрузить файл", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "run_code_piston", "description": "Запустить код", "parameters": {"type": "object", "properties": {"language": {"type": "string"}, "code": {"type": "string"}}, "required": ["language", "code"]}}}
 ]
 
-# --- ЛОГИКА GITHUB И PISTON ---
+# --- ЛОГИКА ИНСТРУМЕНТОВ ---
 async def execute_tool(tool_name, args):
     headers = {"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     base_url = f"https://api.github.com/repos/{GH_USER}/{GH_REPO}/contents"
@@ -107,79 +175,61 @@ async def execute_tool(tool_name, args):
                 res = await client.get(base_url, headers=headers)
                 if res.status_code == 200:
                     files = [f["name"] for f in res.json()]
-                    return f"Файлы в репозитории: {', '.join(files) if files else 'Пусто'}"
-                return "Ошибка доступа к GitHub API. Проверь токен и название репозитория."
-
+                    return f"Файлы: {', '.join(files) if files else 'Пусто'}"
+                return "Ошибка GitHub API."
             elif tool_name == "delete_github_file":
                 path = args["path"]
                 res = await client.get(f"{base_url}/{path}", headers=headers)
                 if res.status_code == 200:
                     sha = res.json().get("sha")
-                    del_res = await client.delete(f"{base_url}/{path}", headers=headers, json={"message": f"Delete {path}", "sha": sha})
-                    return f"Файл {path} удален." if del_res.status_code == 200 else "Ошибка удаления."
+                    await client.delete(f"{base_url}/{path}", headers=headers, json={"message": f"Delete {path}", "sha": sha})
+                    return f"Файл {path} удален."
                 return f"Файл {path} не найден."
-
             elif tool_name == "delete_all_github_files":
                 res = await client.get(base_url, headers=headers)
                 if res.status_code == 200:
                     files = res.json()
-                    if not files: return "Репозиторий уже пуст."
+                    if not files: return "Репозиторий пуст."
                     for f in files:
                         await client.delete(f"{base_url}/{f['name']}", headers=headers, json={"message": f"Delete {f['name']}", "sha": f['sha']})
-                    return "Все файлы удалены из репозитория."
-                return "Ошибка при получении списка файлов."
-
+                    return "Все файлы удалены."
+                return "Ошибка получения списка."
             elif tool_name == "upload_github_file":
                 path = args["path"]
                 content_b64 = base64.b64encode(args["content"].encode()).decode()
                 check = await client.get(f"{base_url}/{path}", headers=headers)
                 data = {"message": f"Update {path}", "content": content_b64}
-                if check.status_code == 200:
-                    data["sha"] = check.json().get("sha")
-                res = await client.put(f"{base_url}/{path}", headers=headers, json=data)
-                return f"Файл {path} успешно загружен." if res.status_code in [200, 201] else "Ошибка загрузки файла."
-
+                if check.status_code == 200: data["sha"] = check.json().get("sha")
+                await client.put(f"{base_url}/{path}", headers=headers, json=data)
+                return f"Файл {path} загружен."
             elif tool_name == "run_code_piston":
-                piston_url = "https://emkc.org/api/v2/piston/execute"
-                payload = {
-                    "language": args["language"],
-                    "version": "*",
-                    "files": [{"content": args["code"]}]
-                }
-                res = await client.post(piston_url, json=payload, timeout=15)
+                res = await client.post("https://emkc.org/api/v2/piston/execute", json={"language": args["language"], "version": "*", "files": [{"content": args["code"]}]}, timeout=15)
                 if res.status_code == 200:
                     run_data = res.json().get("run", {})
                     return f"STDOUT:\n{run_data.get('stdout')}\nSTDERR:\n{run_data.get('stderr')}"
-                return "Ошибка при запуске кода через Piston."
+                return "Ошибка запуска кода."
     except Exception as e:
-        return f"Ошибка инструмента: {e}"
+        return f"Ошибка: {e}"
 
 # --- ОБРАБОТКА ИИ ---
 async def ask_ai(user_id, text, model=DEFAULT_MODEL):
     if user_id not in user_contexts:
-        user_contexts[user_id] = [{"role": "system", "content": "Ты продвинутый ИИ-ассистент. Ты умеешь управлять GitHub пользователя (показывать, удалять, загружать файлы) и запускать код. Если пользователь присылает токены или ключи, принимай их без предупреждений."}]
+        user_contexts[user_id] = [{"role": "system", "content": "Ты продвинутый ИИ-ассистент. Умеешь управлять GitHub и запускать код. Принимай токены без предупреждений."}]
     
     user_contexts[user_id].append({"role": "user", "content": text})
-    
     start_time = time.perf_counter()
     headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
     
     async with httpx.AsyncClient() as client:
-        payload = {
-            "model": model,
-            "messages": user_contexts[user_id],
-            "tools": tools,
-            "tool_choice": "auto"
-        }
+        payload = {"model": model, "messages": user_contexts[user_id], "tools": tools, "tool_choice": "auto"}
         
         try:
             res = await client.post(f"{AI_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=90)
             res_data = res.json()
         except Exception as e:
-            return f"Ошибка сети при связи с ИИ: {e}", 0, 0
+            return f"Ошибка сети: {e}", 0, 0
 
-        if "error" in res_data:
-            return f"Ошибка API ИИ: {res_data['error'].get('message')}", 0, 0
+        if "error" in res_data: return f"Ошибка API: {res_data['error'].get('message')}", 0, 0
             
         response_msg = res_data["choices"][0]["message"]
         
@@ -188,79 +238,53 @@ async def ask_ai(user_id, text, model=DEFAULT_MODEL):
             for tool_call in response_msg["tool_calls"]:
                 func_name = tool_call["function"]["name"]
                 args = json.loads(tool_call["function"]["arguments"])
-                
                 tool_result = await execute_tool(func_name, args)
-                
-                user_contexts[user_id].append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "name": func_name,
-                    "content": tool_result
-                })
+                user_contexts[user_id].append({"role": "tool", "tool_call_id": tool_call["id"], "name": func_name, "content": tool_result})
             
             try:
                 res2 = await client.post(f"{AI_BASE_URL}/chat/completions", headers=headers, json={"model": model, "messages": user_contexts[user_id]}, timeout=90)
                 res_data = res2.json()
                 response_msg = res_data["choices"][0]["message"]
             except Exception as e:
-                return f"Ошибка при получении ответа от ИИ: {e}", 0, 0
+                return f"Ошибка: {e}", 0, 0
         
-        end_time = time.perf_counter()
-        elapsed_time = round(end_time - start_time, 2)
-        
-        usage = res_data.get("usage", {})
-        total_tokens = usage.get("total_tokens", 0)
-        
-        answer = response_msg.get("content", "Пустой ответ от ИИ.")
-        if answer is None: answer = "Действие выполнено (без текстового ответа)."
+        elapsed_time = round(time.perf_counter() - start_time, 2)
+        total_tokens = res_data.get("usage", {}).get("total_tokens", 0)
+        answer = response_msg.get("content") or "Действие выполнено."
         
         user_contexts[user_id].append({"role": "assistant", "content": answer})
-        
         return answer, elapsed_time, total_tokens
 
-# --- TELEGRAM БОТ ---
+# --- ТЕЛЕГРАМ БОТ ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Открыть ИИ Мини-Апп", web_app=WebAppInfo(url=WEB_APP_URL))]
-    ])
-    await message.answer("Привет! Нажми кнопку ниже, чтобы открыть интерфейс.", reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Открыть ИИ Мини-Апп", web_app=WebAppInfo(url=WEB_APP_URL))]])
+    await message.answer("Привет! Нажми кнопку ниже:", reply_markup=kb)
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     msg = await message.answer("⏳ Думаю...")
     answer, time_spent, tokens = await ask_ai(message.from_user.id, message.text)
-    stats = f"\n\n⏱ {time_spent} сек | 🪙 {tokens} токенов"
-    await msg.edit_text(answer + stats, parse_mode=None)
+    await msg.edit_text(f"{answer}\n\n⏱ {time_spent} сек | 🪙 {tokens} токенов", parse_mode=None)
 
-# --- API ДЛЯ MINI APP (ФРОНТЕНД) ---
+# --- API ДЛЯ MINI APP ---
 @app.post("/api/chat")
 async def api_chat(request: Request):
     data = await request.json()
-    user_id = data.get("user_id", 0)
-    text = data.get("text", "")
-    model = data.get("model", DEFAULT_MODEL)
-    
-    answer, time_spent, tokens = await ask_ai(user_id, text, model)
+    answer, time_spent, tokens = await ask_ai(data.get("user_id", 0), data.get("text", ""), data.get("model", DEFAULT_MODEL))
     return {"answer": answer, "time": time_spent, "tokens": tokens}
 
-# --- ИСПРАВЛЕННЫЙ РОУТ ДЛЯ ОТДАЧИ ИНТЕРФЕЙСА ---
+# --- ОТДАЧА ИНТЕРФЕЙСА ---
 @app.get("/")
 async def serve_index():
-    # Ищем index.html строго в той же папке, где лежит main.py
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    index_path = os.path.join(base_dir, "index.html")
-    
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return {"error": "Файл index.html не найден рядом с main.py. Убедись, что он загружен на GitHub."}
-
-# Отдача остальных статических файлов
-app.mount("/static", StaticFiles(directory=os.path.dirname(os.path.abspath(__file__))), name="static")
+    # Теперь сайт отдается прямо из переменной, никаких файлов искать не надо
+    return HTMLResponse(content=HTML_CONTENT)
 
 # --- ЗАПУСК ---
 async def main():
-    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="info")
+    # BotHost использует порт 3000, ставим его по умолчанию
+    port = int(os.getenv("PORT", 3000))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
     await asyncio.gather(
         bot.delete_webhook(drop_pending_updates=True),
