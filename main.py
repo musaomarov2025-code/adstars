@@ -7,6 +7,7 @@ import asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
@@ -95,7 +96,7 @@ tools = [
     }
 ]
 
-# --- ЛОГИКА GITHUB И PISTON (ЧЕРЕЗ HTTPX, БЕЗ PYGITHUB) ---
+# --- ЛОГИКА GITHUB И PISTON ---
 async def execute_tool(tool_name, args):
     headers = {"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     base_url = f"https://api.github.com/repos/{GH_USER}/{GH_REPO}/contents"
@@ -182,7 +183,6 @@ async def ask_ai(user_id, text, model=DEFAULT_MODEL):
             
         response_msg = res_data["choices"][0]["message"]
         
-        # Если ИИ просит вызвать функцию
         if response_msg.get("tool_calls"):
             user_contexts[user_id].append(response_msg)
             for tool_call in response_msg["tool_calls"]:
@@ -198,7 +198,6 @@ async def ask_ai(user_id, text, model=DEFAULT_MODEL):
                     "content": tool_result
                 })
             
-            # Отправляем результат инструмента обратно ИИ для финального ответа
             try:
                 res2 = await client.post(f"{AI_BASE_URL}/chat/completions", headers=headers, json={"model": model, "messages": user_contexts[user_id]}, timeout=90)
                 res_data = res2.json()
@@ -245,8 +244,19 @@ async def api_chat(request: Request):
     answer, time_spent, tokens = await ask_ai(user_id, text, model)
     return {"answer": answer, "time": time_spent, "tokens": tokens}
 
-# Раздача HTML файла (index.html) на главной странице
-app.mount("/", StaticFiles(directory=".", html=True), name="static")
+# --- ИСПРАВЛЕННЫЙ РОУТ ДЛЯ ОТДАЧИ ИНТЕРФЕЙСА ---
+@app.get("/")
+async def serve_index():
+    # Ищем index.html строго в той же папке, где лежит main.py
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    index_path = os.path.join(base_dir, "index.html")
+    
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"error": "Файл index.html не найден рядом с main.py. Убедись, что он загружен на GitHub."}
+
+# Отдача остальных статических файлов
+app.mount("/static", StaticFiles(directory=os.path.dirname(os.path.abspath(__file__))), name="static")
 
 # --- ЗАПУСК ---
 async def main():
