@@ -4,6 +4,7 @@ import base64
 import json
 import httpx
 import asyncio
+import threading
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -29,7 +30,7 @@ dp = Dispatcher()
 app = FastAPI()
 user_contexts = {}
 
-# ИНТЕРФЕЙС ВШИТ СЮДА
+# --- ИНТЕРФЕЙС ---
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -89,12 +90,10 @@ HTML_CONTENT = """
                     body: JSON.stringify({ user_id: userId, text: text, model: document.getElementById('model').value })
                 });
                 const data = await response.json();
-                const loadingEl = document.getElementById(loadingId);
-                if (loadingEl) loadingEl.remove();
+                document.getElementById(loadingId).remove();
                 addMessage(data.answer, 'ai', null, data.time, data.tokens);
             } catch (e) {
-                const loadingEl = document.getElementById(loadingId);
-                if (loadingEl) loadingEl.remove();
+                document.getElementById(loadingId).remove();
                 addMessage('Ошибка сервера.', 'ai');
             }
         }
@@ -206,16 +205,21 @@ async def api_chat(request: Request):
 async def serve_index():
     return HTMLResponse(content=HTML_CONTENT)
 
-# --- ПРАВИЛЬНЫЙ ЗАПУСК ---
+# --- ТЕСТОВАЯ СТРАНИЦА (чтобы проверить, работает ли сайт) ---
+@app.get("/ping")
+async def ping():
+    return {"status": "ok", "message": "Web server is running!"}
+
+# --- ЗАПУСК В ОТДЕЛЬНОМ ПОТОКЕ ---
+def run_web_server():
+    # BotHost обычно требует порт 3000, жестко фиксируем его
+    uvicorn.run(app, host="0.0.0.0", port=3000, log_level="info")
+
 async def main():
-    # Принудительно ставим 3000 порт, как на скрине логов
-    config = uvicorn.Config(app, host="0.0.0.0", port=3000, log_level="info")
-    server = uvicorn.Server(config)
+    # 1. Запускаем веб-сервер в фоне (отдельный поток)
+    threading.Thread(target=run_web_server, daemon=True).start()
     
-    # Запускаем веб-сервер в фоне
-    asyncio.create_task(server.serve())
-    
-    # Запускаем бота (он блокирует поток, поэтому идет последним)
+    # 2. Запускаем бота
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
