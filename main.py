@@ -23,7 +23,7 @@ GH_TOKEN = os.getenv("GITHUB_TOKEN")
 GH_USER = os.getenv("GITHUB_USERNAME")
 GH_REPO = os.getenv("GITHUB_REPO")
 
-WEB_APP_URL = "https://bot-1793277514-5190-savik.bothost.tech"
+WEB_APP_URL = "https://bot-1793460794-9525-savik.bothost.tech"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
