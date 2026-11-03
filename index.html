@@ -9,119 +9,105 @@
         :root { --bg: #141419; --bg2: #1c1c24; --text: #e0e0e0; --accent: #d452d4; --border: #2a2a35; }
         body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
         
-        /* Шапка */
-        .header { padding: 12px 15px; background: var(--bg); display: flex; justify-content: space-between; align-items: center; z-index: 10; border-bottom: 1px solid var(--border); }
-        .menu-btn { font-size: 24px; cursor: pointer; color: var(--text); }
-        .model-select { background: transparent; color: var(--text); border: none; font-size: 16px; font-weight: 600; outline: none; text-align: center; -webkit-appearance: none; }
+        .header { padding: 12px 15px; background: var(--bg); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
+        .menu-btn { font-size: 24px; cursor: pointer; }
+        .model-select { background: transparent; color: var(--text); border: none; font-size: 16px; font-weight: 600; outline: none; text-align: center; }
         
-        /* Шторка слева (Чаты и Профиль) */
-        .sidebar { position: fixed; top: 0; left: -300px; width: 300px; height: 100%; background: #ffffff; color: #000; transition: 0.3s ease; z-index: 100; display: flex; flex-direction: column; }
+        /* Шторка слева */
+        .sidebar { position: fixed; top: 0; left: -300px; width: 280px; height: 100%; background: #ffffff; color: #000; transition: 0.3s; z-index: 100; display: flex; flex-direction: column; }
         .sidebar.open { left: 0; }
         .sidebar-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 99; display: none; }
         .sidebar-overlay.open { display: block; }
-        
-        .sidebar-header { padding: 20px; display: flex; justify-content: space-between; align-items: center; font-size: 20px; font-weight: bold; border-bottom: 1px solid #eee; }
-        .new-chat-btn { background: var(--accent); color: white; border: none; padding: 8px 15px; border-radius: 10px; cursor: pointer; font-weight: bold; }
+        .sidebar-header { padding: 15px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; }
+        .new-chat-btn { background: var(--accent); color: white; border: none; padding: 8px 12px; border-radius: 8px; font-weight: bold; cursor: pointer; }
         
         .chat-list { flex: 1; overflow-y: auto; }
-        .chat-item { padding: 15px 20px; border-bottom: 1px solid #f0f0f0; cursor: pointer; font-size: 15px; }
+        .chat-item { padding: 12px 15px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
         .chat-item:hover { background: #f9f9f9; }
 
-        /* Профиль (Токены) */
-        .profile-card { background: #f7f7f9; border-radius: 15px; margin: 15px; padding: 15px; }
-        .progress-bg { height: 8px; background: #e0e0e0; border-radius: 4px; margin: 10px 0; overflow: hidden; }
-        .progress-bar { height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.5s; }
-        .limits-text { display: flex; justify-content: space-between; font-size: 14px; font-weight: 500; }
+        /* Профиль */
+        .profile-card { background: #f7f7f9; border-radius: 15px; margin: 15px; padding: 15px; font-size: 14px; }
+        .progress-bg { height: 8px; background: #e0e0e0; border-radius: 4px; margin: 8px 0; }
+        .progress-bar { height: 100%; background: var(--accent); border-radius: 4px; }
 
         /* Чат */
-        .chat { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; background: var(--bg); }
+        .chat { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
         .message { max-width: 85%; padding: 12px 16px; border-radius: 18px; line-height: 1.4; font-size: 15px; white-space: pre-wrap; }
         .msg-user { align-self: flex-end; background: var(--bg2); border: 1px solid var(--border); border-bottom-right-radius: 4px; }
         .msg-ai { align-self: flex-start; background: rgba(212, 82, 212, 0.05); border: 1px solid rgba(212, 82, 212, 0.2); border-bottom-left-radius: 4px; }
         .stats { font-size: 11px; color: #888; margin-top: 6px; text-align: right; }
 
-        /* Таймер загрузки */
-        .loading-bubble { align-self: flex-start; background: rgba(212, 82, 212, 0.1); border: 1px dashed var(--accent); padding: 10px 15px; border-radius: 18px; font-size: 14px; font-style: italic; color: #aaa; }
+        /* Статус DeepSeek */
+        .status-bubble { align-self: flex-start; background: rgba(255,255,255,0.05); border: 1px solid var(--border); padding: 10px 15px; border-radius: 18px; font-size: 14px; color: #aaa; display: flex; align-items: center; gap: 8px; font-style: italic; }
+        .spinner { width: 14px; height: 14px; border: 2px solid #aaa; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
 
-        /* Панель ввода */
+        /* Ввод */
         .input-area { padding: 10px 15px 20px 15px; background: var(--bg); border-top: 1px solid var(--border); }
         .input-row { display: flex; gap: 8px; align-items: center; background: var(--bg2); border: 1px solid var(--border); border-radius: 25px; padding: 5px 10px; }
-        .input-row input { flex: 1; background: transparent; border: none; color: var(--text); padding: 10px 0; outline: none; font-size: 15px; }
+        .input-row input { flex: 1; background: transparent; border: none; color: var(--text); padding: 10px 0; outline: none; }
         .icon-btn { background: transparent; color: #888; border: none; font-size: 20px; cursor: pointer; }
-        .send-btn { background: var(--accent); color: white; border: none; width: 36px; height: 36px; border-radius: 50%; font-size: 16px; cursor: pointer; }
+        .send-btn { background: var(--accent); color: white; border: none; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; }
 
-        /* Нижняя шторка (+) */
-        .bottom-sheet { position: fixed; bottom: -100%; left: 0; width: 100%; background: var(--bg2); border-radius: 20px 20px 0 0; transition: 0.3s ease; z-index: 100; padding: 20px; box-sizing: border-box; border-top: 1px solid var(--border); }
+        /* Нижняя шторка */
+        .bottom-sheet { position: fixed; bottom: -100%; left: 0; width: 100%; background: var(--bg2); border-radius: 20px 20px 0 0; transition: 0.3s; z-index: 100; padding: 20px; border-top: 1px solid var(--border); box-sizing: border-box; }
         .bottom-sheet.open { bottom: 0; }
         .sheet-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 99; display: none; }
         .sheet-overlay.open { display: block; }
-        .sheet-row { display: flex; justify-content: space-around; margin-bottom: 15px; }
-        .sheet-item { text-align: center; cursor: pointer; color: var(--text); font-size: 14px; }
+        .sheet-row { display: flex; justify-content: space-around; }
+        .sheet-item { display: flex; flex-direction: column; align-items: center; cursor: pointer; }
         .sheet-icon { font-size: 28px; margin-bottom: 5px; }
     </style>
 </head>
 <body>
-    <!-- Шторка слева -->
-    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+    <div class="sidebar-overlay" id="overlay" onclick="toggleMenu()"></div>
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
-            <span>ИИ-чат</span>
-            <button class="new-chat-btn" onclick="createNewChat()">+ Новый</button>
+            <b>ИИ-чат</b>
+            <button class="new-chat-btn" onclick="createChat()">+ Новый</button>
         </div>
         <div class="chat-list" id="chatList"></div>
-        
         <div class="profile-card">
-            <div style="font-weight:bold; margin-bottom: 5px;">Твой Баланс</div>
-            <div class="limits-text">
-                <span>Осталось:</span>
+            <div style="display:flex; justify-content:space-between; font-weight:bold;">
+                <span>Баланс:</span>
                 <span id="tokenPercent">100%</span>
             </div>
-            <div class="progress-bg"><div class="progress-bar" id="tokenBar" style="width: 100%;"></div></div>
-            <div style="font-size: 12px; color: #888;" id="tokenText">0 / 100 000 000</div>
+            <div class="progress-bg"><div class="progress-bar" id="tokenBar" style="width:100%;"></div></div>
+            <div style="font-size:12px; color:#888;" id="tokenText">0 / 100 000 000</div>
+            <div style="margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px; cursor: pointer;" onclick="showMemory()">🧠 Память</div>
         </div>
     </div>
 
-    <!-- Шапка -->
     <div class="header">
-        <div class="menu-btn" onclick="toggleSidebar()">☰</div>
+        <div class="menu-btn" onclick="toggleMenu()">☰</div>
         <select class="model-select" id="model">
             <option value="claude-sonnet-5-5" selected>claude-sonnet-5-5</option>
             <option value="claude-opus-5-5">claude-opus-5-5</option>
             <option value="gpt-6.1-sol">gpt-6.1-sol</option>
-            <option value="gpt-5.5">gpt-5.5</option>
         </select>
         <div style="width:24px;"></div>
     </div>
 
-    <!-- Чат -->
     <div class="chat" id="chat"></div>
 
-    <!-- Панель ввода -->
     <div class="input-area">
         <div class="input-row">
             <button class="icon-btn" onclick="toggleSheet()">➕</button>
-            <input type="text" id="messageInput" placeholder="Спроси..." onkeypress="if(event.key === 'Enter') sendMessage()">
+            <input type="text" id="msgInput" placeholder="Спроси..." onkeypress="if(event.key==='Enter') sendMessage()">
             <button class="send-btn" onclick="sendMessage()">➤</button>
         </div>
     </div>
 
-    <!-- Нижняя шторка -->
+    <!-- Скрытые инпуты для файлов -->
+    <input type="file" id="fileInput" style="display:none;" onchange="uploadFile(this)">
+
     <div class="sheet-overlay" id="sheetOverlay" onclick="toggleSheet()"></div>
     <div class="bottom-sheet" id="bottomSheet">
-        <div style="text-align:center; margin-bottom:15px; font-weight:bold; color:#aaa;">ДОБАВИТЬ В ЧАТ</div>
+        <div style="text-align:center; font-weight:bold; margin-bottom:15px; color:#aaa;">ДОБАВИТЬ В ЧАТ</div>
         <div class="sheet-row">
+            <div class="sheet-item" onclick="document.getElementById('fileInput').click()"><div class="sheet-icon">📁</div>Файлы</div>
             <div class="sheet-item"><div class="sheet-icon">📷</div>Камера</div>
-            <div class="sheet-item"><div class="sheet-icon">🖼️</div>Фото</div>
-            <div class="sheet-item"><div class="sheet-icon">📁</div>Файлы</div>
-        </div>
-        <div style="border-top: 1px solid var(--border); padding-top: 15px;">
-            <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
-                <span>Поиск в интернете</span>
-                <span style="color:var(--accent);">Авто</span>
-            </div>
-            <div style="display:flex; justify-content:space-between;">
-                <span>Режим: Обычный</span>
-            </div>
+            <div class="sheet-item" onclick="toggleSheet(); addStatus('🌐 Ищу в интернете...', 2000)"><div class="sheet-icon">🌐</div>Поиск</div>
         </div>
     </div>
 
@@ -132,20 +118,14 @@
         const chatDiv = document.getElementById('chat');
         let currentChatId = null;
 
-        // Инициализация
-        window.onload = async () => {
-            await loadProfile();
-            await loadChats();
-        };
+        window.onload = () => { loadProfile(); loadChats(); };
 
         async function loadProfile() {
-            try {
-                const res = await fetch(`/api/profile?user_id=${userId}`);
-                const data = await res.json();
-                document.getElementById('tokenPercent').innerText = `${data.percent}%`;
-                document.getElementById('tokenBar').style.width = `${data.percent}%`;
-                document.getElementById('tokenText').innerText = `${data.used.toLocaleString()} / ${data.limit.toLocaleString()}`;
-            } catch(e) {}
+            const res = await fetch(`/api/profile?user_id=${userId}`);
+            const data = await res.json();
+            document.getElementById('tokenPercent').innerText = `${data.percent}%`;
+            document.getElementById('tokenBar').style.width = `${data.percent}%`;
+            document.getElementById('tokenText').innerText = `${data.used.toLocaleString()} / ${data.limit.toLocaleString()}`;
         }
 
         async function loadChats() {
@@ -160,92 +140,100 @@
                 div.onclick = () => selectChat(c.id);
                 list.appendChild(div);
             });
-            if (chats.length > 0 && !currentChatId) {
-                selectChat(chats[0].id);
-            } else if (chats.length === 0) {
-                createNewChat();
-            }
+            if (chats.length > 0 && !currentChatId) selectChat(chats[0].id);
+        }
+
+        async function createChat() {
+            const title = prompt("Название нового диалога:", "Новый чат");
+            if (title === null) return;
+            const res = await fetch('/api/new_chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ user_id: userId, title: title || "Без названия" }) });
+            const data = await res.json();
+            currentChatId = data.chat_id;
+            chatDiv.innerHTML = '';
+            addMessage('Диалог создан. Чем помогу?', 'ai');
+            loadChats();
+            toggleMenu();
         }
 
         async function selectChat(id) {
             currentChatId = id;
-            toggleSidebar();
+            toggleMenu();
             chatDiv.innerHTML = '';
             const res = await fetch(`/api/history?chat_id=${id}`);
             const history = await res.json();
-            history.forEach(msg => addMessage(msg.content, msg.role === 'user' ? 'user' : 'ai', null, msg.time_spent, msg.tokens));
+            history.forEach(m => addMessage(m.content, m.role === 'user' ? 'user' : 'ai', m.time_spent, m.tokens));
         }
 
-        async function createNewChat() {
-            const res = await fetch('/api/new_chat', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ user_id: userId })
-            });
-            const data = await res.json();
-            currentChatId = data.chat_id;
-            chatDiv.innerHTML = '';
-            addMessage('Новый диалог начат. Чем займёмся?', 'ai');
-            loadChats();
-            toggleSidebar();
-        }
-
-        function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); document.getElementById('sidebarOverlay').classList.toggle('open'); }
+        function toggleMenu() { document.getElementById('sidebar').classList.toggle('open'); document.getElementById('overlay').classList.toggle('open'); }
         function toggleSheet() { document.getElementById('bottomSheet').classList.toggle('open'); document.getElementById('sheetOverlay').classList.toggle('open'); }
 
+        async function showMemory() {
+            const res = await fetch(`/api/memory?user_id=${userId}`);
+            const data = await res.json();
+            alert("🧠 Что я о тебе помню:\n\n" + data.facts);
+        }
+
+        async function uploadFile(input) {
+            if (!input.files || input.files.length === 0) return;
+            toggleSheet();
+            addMessage(`📄 Файл загружается...`, 'user');
+            
+            const formData = new FormData();
+            formData.append("user_id", userId);
+            formData.append("file", input.files[0]);
+            
+            try {
+                const res = await fetch('/api/upload', { method: 'POST', body: formData });
+                const data = await res.json();
+                addMessage(`✅ Файл прочитан! (${data.full_length} символов)`, 'ai');
+                document.getElementById('msgInput').value = `Сделай анализ этого файла: ${data.text}`;
+            } catch(e) { addMessage("Ошибка загрузки файла", 'ai'); }
+        }
+
+        function addStatus(text, delayMs = 0) {
+            const id = 'status-' + Date.now();
+            const div = document.createElement('div');
+            div.className = 'status-bubble';
+            div.id = id;
+            div.innerHTML = `<div class="spinner"></div> <span>${text}</span>`;
+            chatDiv.appendChild(div);
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+            return id;
+        }
+
         async function sendMessage() {
-            const input = document.getElementById('messageInput');
+            const input = document.getElementById('msgInput');
             const text = input.value.trim();
             if (!text || !currentChatId) return;
             
             addMessage(text, 'user');
             input.value = '';
             
-            // Создаем таймер загрузки
-            const loadingId = 'loading-' + Date.now();
-            const loadingDiv = document.createElement('div');
-            loadingDiv.className = 'loading-bubble';
-            loadingDiv.id = loadingId;
-            loadingDiv.innerHTML = `<span>⏳ Думаю</span> <span class="timer">0.0с</span>`;
-            chatDiv.appendChild(loadingDiv);
-            chatDiv.scrollTop = chatDiv.scrollHeight;
-
-            let seconds = 0.0;
-            const timerInterval = setInterval(() => {
-                seconds += 0.1;
-                const timerSpan = document.querySelector(`#${loadingId} .timer`);
-                if (timerSpan) timerSpan.innerText = `${seconds.toFixed(1)}с`;
-            }, 100);
-
+            const statusId = addStatus('⏳ Думаю...');
+            
             try {
                 const response = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        user_id: userId, 
-                        chat_id: currentChatId, 
-                        text: text, 
-                        model: document.getElementById('model').value 
-                    })
+                    body: JSON.stringify({ user_id: userId, chat_id: currentChatId, text: text, model: document.getElementById('model').value })
                 });
                 const data = await response.json();
                 
-                clearInterval(timerInterval);
-                document.getElementById(loadingId).remove();
-                addMessage(data.answer, 'ai', null, data.time, data.tokens);
-                loadProfile(); // Обновляем счетчик токенов
+                const statusEl = document.getElementById(statusId);
+                if (statusEl) statusEl.remove();
                 
+                addMessage(data.answer, 'ai', data.time, data.tokens);
+                loadProfile();
             } catch (e) {
-                clearInterval(timerInterval);
-                document.getElementById(loadingId).remove();
+                const statusEl = document.getElementById(statusId);
+                if (statusEl) statusEl.remove();
                 addMessage('Ошибка сервера.', 'ai');
             }
         }
 
-        function addMessage(text, type, id = null, time = null, tokens = null) {
+        function addMessage(text, type, time = null, tokens = null) {
             const div = document.createElement('div');
             div.className = `message msg-${type}`;
-            if (id) div.id = id;
             div.innerText = text; 
             if (time !== null && tokens !== null) {
                 const statsDiv = document.createElement('div');
