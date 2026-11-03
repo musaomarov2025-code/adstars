@@ -22,7 +22,6 @@ GH_TOKEN = os.getenv("GITHUB_TOKEN")
 GH_USER = os.getenv("GITHUB_USERNAME")
 GH_REPO = os.getenv("GITHUB_REPO")
 
-# Твой домен
 WEB_APP_URL = "https://bot-1793277514-5190-savik.bothost.tech"
 
 bot = Bot(token=BOT_TOKEN)
@@ -30,128 +29,20 @@ dp = Dispatcher()
 app = FastAPI()
 user_contexts = {}
 
-# --- ИНТЕРФЕЙС С ЗАГРУЗКОЙ ИСТОРИИ И ВСЕМИ МОДЕЛЯМИ ---
-HTML_CONTENT = """
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>AI Assistant</title>
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <style>
-        :root { --bg: #1e1e24; --bg2: #2b2b36; --text: #e0e0e0; --accent: #d452d4; --border: #3d3d4a; }
-        body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; display: flex; flex-direction: column; height: 100vh; }
-        .header { padding: 15px; background: var(--bg2); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
-        .model-select { background: transparent; color: var(--text); border: none; font-size: 15px; font-weight: 500; outline: none; max-width: 60%; }
-        .new-chat-btn { background: transparent; color: var(--accent); border: 1px solid var(--accent); padding: 5px 10px; border-radius: 10px; cursor: pointer; font-size: 13px; }
-        .chat { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
-        .message { max-width: 85%; padding: 12px 16px; border-radius: 18px; line-height: 1.4; font-size: 15px; white-space: pre-wrap; }
-        .msg-user { align-self: flex-end; background: var(--bg2); border-bottom-right-radius: 4px; }
-        .msg-ai { align-self: flex-start; background: rgba(212, 82, 212, 0.1); border: 1px solid rgba(212, 82, 212, 0.3); border-bottom-left-radius: 4px; }
-        .stats { font-size: 11px; color: #888; margin-top: 6px; text-align: right; }
-        .input-area { padding: 10px; background: var(--bg2); display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--border); }
-        .input-row { display: flex; gap: 10px; align-items: center; }
-        .input-row input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 12px; border-radius: 20px; outline: none; font-size: 15px; }
-        .send-btn { background: var(--accent); color: white; border: none; width: 44px; height: 44px; border-radius: 50%; font-size: 18px; cursor: pointer; display: flex; justify-content: center; align-items: center; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <select class="model-select" id="model">
-            <option value="claude-opus-5-5">claude-opus-5-5</option>
-            <option value="claude-sonnet-5-5" selected>claude-sonnet-5-5</option>
-            <option value="claude-haiku-5-5">claude-haiku-5-5</option>
-            <option value="gpt-6.1-sol">gpt-6.1-sol</option>
-            <option value="gpt-6-sol">gpt-6-sol</option>
-            <option value="gpt-5.6-sol">gpt-5.6-sol</option>
-            <option value="gpt-5.5-pro">gpt-5.5-pro</option>
-            <option value="gpt-5.5">gpt-5.5</option>
-        </select>
-        <button class="new-chat-btn" onclick="resetChat()">➕ Новый диалог</button>
-    </div>
-    <div class="chat" id="chat"></div>
-    <div class="input-area">
-        <div class="input-row">
-            <input type="text" id="messageInput" placeholder="Спроси..." onkeypress="if(event.key === 'Enter') sendMessage()">
-            <button class="send-btn" onclick="sendMessage()">➤</button>
-        </div>
-    </div>
-    <script>
-        const tg = window.Telegram.WebApp;
-        tg.expand();
-        const userId = tg.initDataUnsafe?.user?.id || 123;
-        const chat = document.getElementById('chat');
-
-        // Загружаем историю при открытии
-        window.onload = async () => {
-            try {
-                const res = await fetch(`/api/history?user_id=${userId}`);
-                const history = await res.json();
-                if (history.length === 0) {
-                    addMessage('Привет! Я твой ИИ-ассистент. Могу управлять GitHub и запускать код.', 'ai');
-                } else {
-                    history.forEach(msg => addMessage(msg.content, msg.role === 'user' ? 'user' : 'ai'));
-                }
-            } catch (e) {
-                addMessage('Привет! Я твой ИИ-ассистент.', 'ai');
-            }
-        };
-
-        async function resetChat() {
-            await fetch(`/api/reset?user_id=${userId}`, { method: 'POST' });
-            chat.innerHTML = '';
-            addMessage('Новый диалог начат. Чем займёмся?', 'ai');
-        }
-
-        async function sendMessage() {
-            const input = document.getElementById('messageInput');
-            const text = input.value.trim();
-            if (!text) return;
-            addMessage(text, 'user');
-            input.value = '';
-            const loadingId = 'loading-' + Date.now();
-            addMessage('Думаю...', 'ai', loadingId);
-            try {
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: userId, text: text, model: document.getElementById('model').value })
-                });
-                const data = await response.json();
-                document.getElementById(loadingId).remove();
-                addMessage(data.answer, 'ai', null, data.time, data.tokens);
-            } catch (e) {
-                document.getElementById(loadingId).remove();
-                addMessage('Ошибка сервера.', 'ai');
-            }
-        }
-
-        function addMessage(text, type, id = null, time = null, tokens = null) {
-            const div = document.createElement('div');
-            div.className = `message msg-${type}`;
-            if (id) div.id = id;
-            div.innerText = text; 
-            if (time !== null && tokens !== null) {
-                const statsDiv = document.createElement('div');
-                statsDiv.className = 'stats';
-                statsDiv.innerText = `⏱ ${time} сек | 🪙 ${tokens} токенов`;
-                div.appendChild(statsDiv);
-            }
-            chat.appendChild(div);
-            chat.scrollTop = chat.scrollHeight;
-        }
-    </script>
-</body>
-</html>
-"""
+# Читаем HTML файл, если он есть, иначе отдаем заглушку
+def get_html():
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "<h1>Ошибка: Файл index.html не найден в репозитории!</h1>"
 
 tools = [
     {"type": "function", "function": {"name": "list_github_files", "description": "Показать список файлов в репозитории GitHub", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "delete_github_file", "description": "Удалить файл из репозитория", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "delete_all_github_files", "description": "Удалить все файлы из репозитория", "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {"name": "upload_github_file", "description": "Загрузить файл в репозиторий", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
-    {"type": "function", "function": {"name": "run_code_piston", "description": "Запустить код", "parameters": {"type": "object", "properties": {"language": {"type": "string"}, "code": {"type": "string"}}, "required": ["language", "code"]}}}
+    {"type": "function", "function": {"name": "delete_all_github_files", "description": "Удалить ВСЕ файлы из репозитория", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "upload_github_file", "description": "Загрузить или обновить файл", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "run_code_piston", "description": "Запустить код на Python, JS, C++ и т.д.", "parameters": {"type": "object", "properties": {"language": {"type": "string"}, "code": {"type": "string"}}, "required": ["language", "code"]}}}
 ]
 
 async def execute_tool(tool_name, args):
@@ -165,10 +56,12 @@ async def execute_tool(tool_name, args):
         async with httpx.AsyncClient() as client:
             if tool_name == "list_github_files":
                 res = await client.get(base_url, headers=headers)
+                if res.status_code == 401: return "ОШИБКА 401: Неверный GITHUB_TOKEN."
+                if res.status_code == 404: return "ОШИБКА 404: Репозиторий не найден. Проверь GITHUB_USERNAME и GITHUB_REPO."
                 if res.status_code == 200:
                     files = [f["name"] for f in res.json()]
-                    return f"Список файлов: {', '.join(files) if files else 'Пусто'}"
-                return f"ОШИБКА GITHUB API: {res.status_code} {res.text}"
+                    return f"Файлы в репозитории: {', '.join(files) if files else 'Пусто'}"
+                return f"Ошибка GitHub: {res.text}"
             
             elif tool_name == "delete_github_file":
                 path = args["path"]
@@ -199,7 +92,7 @@ async def execute_tool(tool_name, args):
             
             elif tool_name == "run_code_piston":
                 res = await client.post("https://emkc.org/api/v2/piston/execute", json={"language": args["language"], "version": "*", "files": [{"content": args["code"]}]}, timeout=15)
-                return f"Результат:\n{res.json().get('run', {}).get('stdout')}" if res.status_code == 200 else "Ошибка запуска."
+                return f"Результат выполнения:\n{res.json().get('run', {}).get('stdout')}" if res.status_code == 200 else "Ошибка запуска."
     except Exception as e: 
         return f"Системная ошибка: {e}"
 
@@ -207,7 +100,7 @@ async def ask_ai(user_id, text, model=DEFAULT_MODEL):
     if user_id not in user_contexts:
         user_contexts[user_id] = [{
             "role": "system", 
-            "content": "Ты продвинутый ИИ-ассистент. Ты умеешь управлять GitHub (удалять, загружать, показывать файлы) с помощью инструментов. Если пользователь просит файлы, ОБЯЗАТЕЛЬНО вызывай функцию list_github_files. Если инструмент возвращает ошибку, сообщи пользователю: 'Ошибка доступа к GitHub. Проверь настройки токена'. Никогда не груби пользователю."
+            "content": "Ты продвинутый ИИ-ассистент. Ты умеешь управлять GitHub (удалять, загружать, показывать файлы) и запускать код с помощью инструментов. Если пользователь просит файлы, ОБЯЗАТЕЛЬНО вызывай функцию list_github_files. Если инструмент возвращает ошибку, сообщи её пользователю. Никогда не груби."
         }]
     
     user_contexts[user_id].append({"role": "user", "content": text})
@@ -242,11 +135,10 @@ async def ask_ai(user_id, text, model=DEFAULT_MODEL):
         user_contexts[user_id].append({"role": "assistant", "content": answer})
         return answer, elapsed_time, total_tokens
 
-# --- ТЕЛЕГРАМ БОТ ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Открыть ИИ", web_app=WebAppInfo(url=WEB_APP_URL))]])
-    await message.answer("Жми кнопку:", reply_markup=kb)
+    await message.answer("Жми кнопку, чтобы открыть Mini App:", reply_markup=kb)
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
@@ -254,7 +146,6 @@ async def handle_text(message: types.Message):
     answer, time_spent, tokens = await ask_ai(message.from_user.id, message.text)
     await msg.edit_text(f"{answer}\n\n⏱ {time_spent} сек | 🪙 {tokens} токенов", parse_mode=None)
 
-# --- API ДЛЯ MINI APP ---
 @app.post("/api/chat")
 async def api_chat(request: Request):
     data = await request.json()
@@ -263,7 +154,6 @@ async def api_chat(request: Request):
 
 @app.get("/api/history")
 async def api_history(user_id: int):
-    # Отдаем только сообщения пользователя и ИИ, скрывая системный промпт и вызовы функций
     history = [msg for msg in user_contexts.get(user_id, []) if msg["role"] in ["user", "assistant"]]
     return history
 
@@ -276,7 +166,7 @@ async def api_reset(request: Request):
 
 @app.get("/")
 async def serve_index():
-    return HTMLResponse(content=HTML_CONTENT)
+    return HTMLResponse(content=get_html())
 
 @app.get("/ping")
 async def ping():
@@ -286,9 +176,7 @@ async def main():
     port = int(os.getenv("PORT", 3000))
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
-    server_task = asyncio.create_task(server.serve())
-    bot_task = asyncio.create_task(dp.start_polling(bot))
-    await asyncio.gather(server_task, bot_task)
+    await asyncio.gather(asyncio.create_task(server.serve()), asyncio.create_task(dp.start_polling(bot)))
 
 if __name__ == "__main__":
     asyncio.run(main())
