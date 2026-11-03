@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Assistant</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        :root { --bg: #141419; --bg2: #1c1c24; --text: #e0e0e0; --accent: #d452d4; --border: #2a2a35; }
+        body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        
+        /* Шапка */
+        .header { padding: 12px 15px; background: var(--bg); display: flex; justify-content: space-between; align-items: center; z-index: 10; }
+        .menu-btn { font-size: 24px; cursor: pointer; color: var(--text); }
+        .model-select { background: transparent; color: var(--text); border: none; font-size: 16px; font-weight: 600; outline: none; text-align: center; -webkit-appearance: none; }
+        .edit-btn { font-size: 20px; cursor: pointer; color: var(--text); }
+
+        /* Шторка слева (как на скрине RoLab) */
+        .sidebar { position: fixed; top: 0; left: -300px; width: 300px; height: 100%; background: #ffffff; color: #000; transition: 0.3s ease; z-index: 100; display: flex; flex-direction: column; }
+        .sidebar.open { left: 0; }
+        .sidebar-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 99; display: none; }
+        .sidebar-overlay.open { display: block; }
+        .sidebar-header { padding: 20px; display: flex; align-items: center; gap: 10px; font-size: 20px; font-weight: bold; }
+        .menu-list { flex: 1; overflow-y: auto; }
+        .menu-item { padding: 15px 20px; font-size: 16px; display: flex; align-items: center; gap: 15px; cursor: pointer; }
+        .menu-item:hover { background: #f0f0f0; }
+        
+        /* Профиль внизу шторки */
+        .profile-card { background: #f7f7f9; border-radius: 15px; margin: 15px; padding: 15px; }
+        .profile-avatar { width: 40px; height: 40px; border-radius: 50%; background: #ff7b00; color: white; display: flex; justify-content: center; align-items: center; font-size: 20px; font-weight: bold; margin-bottom: 10px; }
+        .progress-bg { height: 6px; background: #e0e0e0; border-radius: 3px; margin: 5px 0 15px 0; overflow: hidden; }
+        .progress-bar { height: 100%; background: var(--accent); border-radius: 3px; }
+        .limits-text { display: flex; justify-content: space-between; font-size: 13px; font-weight: 500; }
+
+        /* Чат */
+        .chat { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; background: var(--bg); }
+        .message { max-width: 85%; padding: 12px 16px; border-radius: 18px; line-height: 1.4; font-size: 15px; white-space: pre-wrap; }
+        .msg-user { align-self: flex-end; background: var(--bg2); border: 1px solid var(--border); border-bottom-right-radius: 4px; }
+        .msg-ai { align-self: flex-start; background: rgba(212, 82, 212, 0.05); border: 1px solid rgba(212, 82, 212, 0.2); border-bottom-left-radius: 4px; }
+        .stats { font-size: 11px; color: #888; margin-top: 6px; text-align: right; }
+
+        /* Панель ввода */
+        .input-area { padding: 10px 15px 20px 15px; background: var(--bg); }
+        .input-row { display: flex; gap: 8px; align-items: center; background: var(--bg2); border: 1px solid var(--border); border-radius: 25px; padding: 5px 10px; }
+        .input-row input { flex: 1; background: transparent; border: none; color: var(--text); padding: 10px 0; outline: none; font-size: 15px; }
+        .icon-btn { background: transparent; color: #888; border: none; font-size: 20px; cursor: pointer; display: flex; justify-content: center; align-items: center; }
+        .send-btn { background: var(--accent); color: white; border: none; width: 36px; height: 36px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-size: 16px; cursor: pointer; }
+
+        /* Нижняя шторка (Bottom Sheet) */
+        .bottom-sheet { position: fixed; bottom: -100%; left: 0; width: 100%; background: var(--bg2); border-radius: 20px 20px 0 0; transition: 0.3s ease; z-index: 100; padding: 20px; box-sizing: border-box; border-top: 1px solid var(--border); }
+        .bottom-sheet.open { bottom: 0; }
+        .sheet-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 99; display: none; }
+        .sheet-overlay.open { display: block; }
+        .sheet-row { display: flex; justify-content: space-around; margin-bottom: 20px; }
+        .sheet-item { display: flex; flex-direction: column; align-items: center; gap: 8px; cursor: pointer; }
+        .sheet-icon { width: 50px; height: 50px; background: var(--bg); border-radius: 15px; display: flex; justify-content: center; align-items: center; font-size: 24px; }
+        .sheet-text { font-size: 12px; color: #aaa; }
+        .toggle-row { display: flex; justify-content: space-between; align-items: center; padding: 15px 0; border-bottom: 1px solid var(--border); }
+        .toggle-btn { background: var(--bg); border: none; color: var(--text); padding: 5px 15px; border-radius: 15px; font-size: 14px; cursor: pointer; }
+        .toggle-btn.active { background: var(--accent); color: white; }
+    </style>
+</head>
+<body>
+    <!-- Шторка слева -->
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+    <div class="sidebar" id="sidebar">
+        <div class="sidebar-header">ИИ-чат</div>
+        <div class="menu-list">
+            <div class="menu-item">✨ Студия</div>
+            <div class="menu-item">📚 Библиотека</div>
+            <div class="menu-item">📂 Проекты</div>
+            <div class="menu-item">⚙️ Настройки</div>
+        </div>
+        <div class="profile-card">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom: 15px;">
+                <div class="profile-avatar">U</div>
+                <div>
+                    <div style="font-weight:bold; font-size:15px;" id="userName">Пользователь</div>
+                    <div style="color:#888; font-size:12px;" id="userIdText">ID: 0</div>
+                </div>
+            </div>
+            <div class="limits-text"><span>Лимит 6 часов</span> <span><b>97%</b></span></div>
+            <div class="progress-bg"><div class="progress-bar" style="width: 97%;"></div></div>
+            <div class="limits-text"><span>Лимит 7 дней</span> <span><b>99%</b></span></div>
+            <div class="progress-bg"><div class="progress-bar" style="width: 99%;"></div></div>
+        </div>
+    </div>
+
+    <!-- Шапка -->
+    <div class="header">
+        <div class="menu-btn" onclick="toggleSidebar()">☰</div>
+        <select class="model-select" id="model">
+            <option value="claude-opus-5-5">claude-opus-5-5</option>
+            <option value="claude-sonnet-5-5" selected>claude-sonnet-5-5</option>
+            <option value="claude-haiku-5-5">claude-haiku-5-5</option>
+            <option value="gpt-6.1-sol">gpt-6.1-sol</option>
+            <option value="gpt-6-sol">gpt-6-sol</option>
+            <option value="gpt-5.6-sol">gpt-5.6-sol</option>
+            <option value="gpt-5.5-pro">gpt-5.5-pro</option>
+        </select>
+        <div class="edit-btn" onclick="resetChat()">📝</div>
+    </div>
+
+    <!-- Чат -->
+    <div class="chat" id="chat"></div>
+
+    <!-- Нижняя шторка -->
+    <div class="sheet-overlay" id="sheetOverlay" onclick="toggleSheet()"></div>
+    <div class="bottom-sheet" id="bottomSheet">
+        <div style="text-align:center; margin-bottom:15px; font-weight:bold;">Добавить в чат</div>
+        <div class="sheet-row">
+            <div class="sheet-item"><div class="sheet-icon">📷</div><div class="sheet-text">Камера</div></div>
+            <div class="sheet-item"><div class="sheet-icon">🖼️</div><div class="sheet-text">Фото</div></div>
+            <div class="sheet-item"><div class="sheet-icon">📁</div><div class="sheet-text">Файлы</div></div>
+        </div>
+        <div class="toggle-row">
+            <div>
+                <div style="font-size:15px;">Поиск в интернете</div>
+                <div style="font-size:12px; color:#888;">Модель сама решает, когда искать</div>
+            </div>
+            <div>
+                <button class="toggle-btn active">Авто</button>
+                <button class="toggle-btn">Выкл</button>
+            </div>
+        </div>
+        <div style="margin-top: 15px;">
+            <div class="toggle-row" style="border:none; padding:10px 0; cursor:pointer;">💡 Рассуждение</div>
+            <div class="toggle-row" style="border:none; padding:10px 0; cursor:pointer;">📖 Учёба</div>
+        </div>
+    </div>
+
+    <!-- Панель ввода -->
+    <div class="input-area">
+        <div class="input-row">
+            <button class="icon-btn" onclick="toggleSheet()">➕</button>
+            <input type="text" id="messageInput" placeholder="Спроси..." onkeypress="if(event.key === 'Enter') sendMessage()">
+            <button class="send-btn" onclick="sendMessage()">➤</button>
+        </div>
+    </div>
+
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.expand();
+        const userId = tg.initDataUnsafe?.user?.id || 123456;
+        const userName = tg.initDataUnsafe?.user?.first_name || "Гость";
+        
+        // Заполняем профиль
+        document.getElementById('userName').innerText = userName;
+        document.getElementById('userIdText').innerText = `ID: ${userId}`;
+
+        const chat = document.getElementById('chat');
+
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+            document.getElementById('sidebarOverlay').classList.toggle('open');
+        }
+
+        function toggleSheet() {
+            document.getElementById('bottomSheet').classList.toggle('open');
+            document.getElementById('sheetOverlay').classList.toggle('open');
+        }
+
+        window.onload = async () => {
+            try {
+                const res = await fetch(`/api/history?user_id=${userId}`);
+                const history = await res.json();
+                if (history.length === 0) {
+                    addMessage('Привет! Я твой ИИ-ассистент. Могу управлять GitHub и запускать код.', 'ai');
+                } else {
+                    history.forEach(msg => addMessage(msg.content, msg.role === 'user' ? 'user' : 'ai'));
+                }
+            } catch (e) {
+                addMessage('Привет! Я твой ИИ-ассистент.', 'ai');
+            }
+        };
+
+        async function resetChat() {
+            await fetch(`/api/reset?user_id=${userId}`, { method: 'POST' });
+            chat.innerHTML = '';
+            addMessage('Новый диалог начат. Чем займёмся?', 'ai');
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const text = input.value.trim();
+            if (!text) return;
+            addMessage(text, 'user');
+            input.value = '';
+            const loadingId = 'loading-' + Date.now();
+            addMessage('Думаю...', 'ai', loadingId);
+            
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ user_id: userId, text: text, model: document.getElementById('model').value })
+                });
+                const data = await response.json();
+                document.getElementById(loadingId).remove();
+                addMessage(data.answer, 'ai', null, data.time, data.tokens);
+            } catch (e) {
+                document.getElementById(loadingId).remove();
+                addMessage('Ошибка сервера. Проверь интернет.', 'ai');
+            }
+        }
+
+        function addMessage(text, type, id = null, time = null, tokens = null) {
+            const div = document.createElement('div');
+            div.className = `message msg-${type}`;
+            if (id) div.id = id;
+            div.innerText = text; 
+            if (time !== null && tokens !== null) {
+                const statsDiv = document.createElement('div');
+                statsDiv.className = 'stats';
+                statsDiv.innerText = `⏱ ${time} сек | 🪙 ${tokens} токенов`;
+                div.appendChild(statsDiv);
+            }
+            chat.appendChild(div);
+            chat.scrollTop = chat.scrollHeight;
+        }
+    </script>
+</body>
+</html>
